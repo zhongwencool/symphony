@@ -110,6 +110,8 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `hooks.timeout_ms` defaults to `300000` (5 minutes), which gives repository bootstrap hooks more
+  room for clone/dependency setup before timing out.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -124,9 +126,18 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- If `hooks.after_create` fails or times out for a newly created workspace, Symphony removes that
+  half-initialized workspace before retrying so the next attempt starts cleanly.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- Optional extension: `tracker.image_inputs` can attach image URLs found in the Linear issue
+  description as Codex `turn/start.params.input` items (`{"type":"image","url":"..."}`).
+  Defaults are:
+  - `enabled: true`
+  - `max_images: 3`
+  - `allowed_hosts: ["uploads.linear.app"]`
+  - `allow_http: false` (HTTPS only)
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
@@ -135,6 +146,11 @@ Notes:
 ```yaml
 tracker:
   api_key: $LINEAR_API_KEY
+  image_inputs:
+    enabled: true
+    max_images: 2
+    allowed_hosts:
+      - uploads.linear.app
 workspace:
   root: $SYMPHONY_WORKSPACE_ROOT
 hooks:

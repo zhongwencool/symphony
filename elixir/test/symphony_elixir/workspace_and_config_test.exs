@@ -169,6 +169,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
                Workspace.create_for_issue("MT-FAIL")
+
+      refute File.exists?(Path.join(workspace_root, "MT-FAIL"))
     after
       File.rm_rf(workspace_root)
     end
@@ -190,6 +192,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:error, {:workspace_hook_timeout, "after_create", 10}} =
                Workspace.create_for_issue("MT-TIMEOUT")
+
+      refute File.exists?(Path.join(workspace_root, "MT-TIMEOUT"))
     after
       File.rm_rf(workspace_root)
     end
@@ -739,7 +743,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.max_retry_backoff_ms() == 300_000
     assert Config.max_concurrent_agents_for_state("Todo") == 1
     assert Config.max_concurrent_agents_for_state("Review") == 10
-    assert Config.hook_timeout_ms() == 60_000
+    assert Config.hook_timeout_ms() == 300_000
     assert Config.observability_enabled?()
     assert Config.observability_refresh_ms() == 1_000
     assert Config.observability_render_interval_ms() == 16

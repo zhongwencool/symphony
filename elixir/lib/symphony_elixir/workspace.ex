@@ -18,9 +18,15 @@ defmodule SymphonyElixir.Workspace do
       workspace = workspace_path_for_issue(safe_id)
 
       with :ok <- validate_workspace_path(workspace),
-           {:ok, created?} <- ensure_workspace(workspace),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?) do
-        {:ok, workspace}
+           {:ok, created?} <- ensure_workspace(workspace) do
+        case maybe_run_after_create_hook(workspace, issue_context, created?) do
+          :ok ->
+            {:ok, workspace}
+
+          {:error, reason} = error ->
+            cleanup_failed_new_workspace(workspace, issue_context, created?, reason)
+            error
+        end
       end
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
@@ -134,6 +140,30 @@ defmodule SymphonyElixir.Workspace do
         end
 
       false ->
+        :ok
+    end
+  end
+
+  defp cleanup_failed_new_workspace(workspace, issue_context, true, {:workspace_hook_timeout, "after_create", _timeout_ms}) do
+    cleanup_failed_workspace(workspace, issue_context)
+  end
+
+  defp cleanup_failed_new_workspace(workspace, issue_context, true, {:workspace_hook_failed, "after_create", _status, _output}) do
+    cleanup_failed_workspace(workspace, issue_context)
+  end
+
+  defp cleanup_failed_new_workspace(_workspace, _issue_context, _created?, _reason), do: :ok
+
+  defp cleanup_failed_workspace(workspace, issue_context) do
+    Logger.warning("Cleaning failed workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace}")
+
+    case File.rm_rf(workspace) do
+      {:ok, _paths} ->
+        :ok
+
+      {:error, path, reason} ->
+        Logger.warning("Failed to clean workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace} path=#{path} reason=#{inspect(reason)}")
+
         :ok
     end
   end

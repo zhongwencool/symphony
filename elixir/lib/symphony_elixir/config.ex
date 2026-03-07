@@ -9,6 +9,10 @@ defmodule SymphonyElixir.Config do
   @default_active_states ["Todo", "In Progress"]
   @default_terminal_states ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
   @default_linear_endpoint "https://api.linear.app/graphql"
+  @default_linear_image_inputs_enabled true
+  @default_linear_image_inputs_max_images 3
+  @default_linear_image_inputs_allowed_hosts ["uploads.linear.app"]
+  @default_linear_image_inputs_allow_http false
   @default_prompt_template """
   You are working on a Linear issue.
 
@@ -24,7 +28,7 @@ defmodule SymphonyElixir.Config do
   """
   @default_poll_interval_ms 30_000
   @default_workspace_root Path.join(System.tmp_dir!(), "symphony_workspaces")
-  @default_hook_timeout_ms 60_000
+  @default_hook_timeout_ms 300_000
   @default_max_concurrent_agents 10
   @default_agent_max_turns 20
   @default_max_retry_backoff_ms 300_000
@@ -61,6 +65,28 @@ defmodule SymphonyElixir.Config do
                                  terminal_states: [
                                    type: {:list, :string},
                                    default: @default_terminal_states
+                                 ],
+                                 image_inputs: [
+                                   type: :map,
+                                   default: %{},
+                                   keys: [
+                                     enabled: [
+                                       type: :boolean,
+                                       default: @default_linear_image_inputs_enabled
+                                     ],
+                                     max_images: [
+                                       type: :pos_integer,
+                                       default: @default_linear_image_inputs_max_images
+                                     ],
+                                     allowed_hosts: [
+                                       type: {:list, :string},
+                                       default: @default_linear_image_inputs_allowed_hosts
+                                     ],
+                                     allow_http: [
+                                       type: :boolean,
+                                       default: @default_linear_image_inputs_allow_http
+                                     ]
+                                   ]
                                  ]
                                ]
                              ],
@@ -172,6 +198,12 @@ defmodule SymphonyElixir.Config do
           before_remove: String.t() | nil,
           timeout_ms: pos_integer()
         }
+  @type linear_image_inputs :: %{
+          enabled: boolean(),
+          max_images: pos_integer(),
+          allowed_hosts: [String.t()],
+          allow_http: boolean()
+        }
 
   @spec current_workflow() :: {:ok, workflow_payload()} | {:error, term()}
   def current_workflow do
@@ -217,6 +249,21 @@ defmodule SymphonyElixir.Config do
   @spec linear_terminal_states() :: [String.t()]
   def linear_terminal_states do
     get_in(validated_workflow_options(), [:tracker, :terminal_states])
+  end
+
+  @spec linear_image_inputs() :: linear_image_inputs()
+  def linear_image_inputs do
+    image_inputs = get_in(validated_workflow_options(), [:tracker, :image_inputs]) || %{}
+
+    %{
+      enabled: Map.get(image_inputs, :enabled, @default_linear_image_inputs_enabled),
+      max_images: Map.get(image_inputs, :max_images, @default_linear_image_inputs_max_images),
+      allowed_hosts:
+        image_inputs
+        |> Map.get(:allowed_hosts, @default_linear_image_inputs_allowed_hosts)
+        |> normalize_image_input_hosts(),
+      allow_http: Map.get(image_inputs, :allow_http, @default_linear_image_inputs_allow_http)
+    }
   end
 
   @spec poll_interval_ms() :: pos_integer()
@@ -465,6 +512,15 @@ defmodule SymphonyElixir.Config do
     |> put_if_present(:project_slug, scalar_string_value(Map.get(section, "project_slug")))
     |> put_if_present(:active_states, csv_value(Map.get(section, "active_states")))
     |> put_if_present(:terminal_states, csv_value(Map.get(section, "terminal_states")))
+    |> put_if_present(:image_inputs, extract_tracker_image_inputs_options(section_map(section, "image_inputs")))
+  end
+
+  defp extract_tracker_image_inputs_options(section) do
+    %{}
+    |> put_if_present(:enabled, boolean_value(Map.get(section, "enabled")))
+    |> put_if_present(:max_images, positive_integer_value(Map.get(section, "max_images")))
+    |> put_if_present(:allowed_hosts, csv_value(Map.get(section, "allowed_hosts"), keep_empty_list: true))
+    |> put_if_present(:allow_http, boolean_value(Map.get(section, "allow_http")))
   end
 
   defp extract_polling_options(section) do
@@ -568,17 +624,22 @@ defmodule SymphonyElixir.Config do
 
   defp hook_command_value(_value), do: :omit
 
-  defp csv_value(values) when is_list(values) do
+  defp csv_value(values, opts \\ [])
+
+  defp csv_value(values, opts) when is_list(values) do
+    keep_empty_list = Keyword.get(opts, :keep_empty_list, false)
+
     values
     |> Enum.reduce([], fn value, acc -> maybe_append_csv_value(acc, value) end)
     |> Enum.reverse()
     |> case do
+      [] when keep_empty_list -> []
       [] -> :omit
       normalized_values -> normalized_values
     end
   end
 
-  defp csv_value(value) when is_binary(value) do
+  defp csv_value(value, _opts) when is_binary(value) do
     value
     |> String.split(",", trim: true)
     |> Enum.map(&String.trim/1)
@@ -589,7 +650,7 @@ defmodule SymphonyElixir.Config do
     end
   end
 
-  defp csv_value(_value), do: :omit
+  defp csv_value(_value, _opts), do: :omit
 
   defp maybe_append_csv_value(acc, value) do
     case scalar_string_value(value) do
@@ -683,6 +744,27 @@ defmodule SymphonyElixir.Config do
       _ -> :error
     end
   end
+
+  defp normalize_image_input_hosts(hosts) when is_list(hosts) do
+    hosts
+    |> Enum.map(&normalize_image_input_host/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_image_input_hosts(_hosts), do: []
+
+  defp normalize_image_input_host(host) when is_binary(host) do
+    host
+    |> String.trim()
+    |> String.downcase()
+    |> case do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_image_input_host(_host), do: nil
 
   defp fetch_value(paths, default) do
     config = workflow_config()

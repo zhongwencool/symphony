@@ -149,6 +149,11 @@ Fields:
   - Human-readable ticket key (example: `ABC-123`).
 - `title` (string)
 - `description` (string or null)
+- `image_urls` (list of strings, optional extension)
+  - Canonicalized remote image URLs extracted from issue content (for example Markdown image tags in
+    `description`).
+  - Intended for optional multimodal turn input when the implementation enables image forwarding.
+  - May be omitted by implementations that do not implement image forwarding.
 - `priority` (integer or null)
   - Lower numbers are higher priority in dispatch sorting.
 - `state` (string)
@@ -355,6 +360,19 @@ Fields:
   - Default: `Todo`, `In Progress`
 - `terminal_states` (list of strings or comma-separated string)
   - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+- `image_inputs` (object, optional extension)
+  - Purpose: control whether issue image URLs are forwarded to Codex as multimodal turn input.
+  - Default posture:
+    - `enabled` (boolean): default `true`
+    - `max_images` (positive integer): default `3`
+    - `allowed_hosts` (list/string): default `uploads.linear.app`
+    - `allow_http` (boolean): default `false` (HTTPS-only)
+  - Recommended behavior when enabled:
+    - extract URLs from issue-authored content only (for example Markdown/HTML image embeds in
+      `description`);
+    - normalize and de-duplicate URLs;
+    - enforce host allowlist and scheme constraints before forwarding;
+    - skip invalid/disallowed URLs without failing the whole run.
 
 #### 5.3.2 `polling` (object)
 
@@ -381,6 +399,7 @@ Fields:
 - `after_create` (multiline shell script string, optional)
   - Runs only when a workspace directory is newly created.
   - Failure aborts workspace creation.
+  - If the hook fails or times out, the newly created workspace directory is removed before retry.
 - `before_run` (multiline shell script string, optional)
   - Runs before each agent attempt after workspace preparation and before launching the coding
     agent.
@@ -393,7 +412,7 @@ Fields:
   - Runs before workspace deletion if the directory exists.
   - Failure is logged but ignored; cleanup still proceeds.
 - `timeout_ms` (integer, optional)
-  - Default: `60000`
+  - Default: `300000`
   - Applies to all workspace hooks.
   - Non-positive values should be treated as invalid and fall back to the default.
   - Changes should be re-applied at runtime for future hook executions.
@@ -457,6 +476,7 @@ Template input variables:
 
 - `issue` (object)
   - Includes all normalized issue fields, including labels and blockers.
+  - If the optional image-input extension is implemented, this may also include `image_urls`.
 - `attempt` (integer or null)
   - `null`/absent on first attempt.
   - Integer on retry or continuation run.
@@ -557,13 +577,17 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `tracker.project_slug`: string, required when `tracker.kind=linear`
 - `tracker.active_states`: list/string, default `Todo, In Progress`
 - `tracker.terminal_states`: list/string, default `Closed, Cancelled, Canceled, Duplicate, Done`
+- `tracker.image_inputs.enabled` (extension): boolean, default `true`
+- `tracker.image_inputs.max_images` (extension): positive integer, default `3`
+- `tracker.image_inputs.allowed_hosts` (extension): list/string, default `uploads.linear.app`
+- `tracker.image_inputs.allow_http` (extension): boolean, default `false`
 - `polling.interval_ms`: integer, default `30000`
 - `workspace.root`: path, default `<system-temp>/symphony_workspaces`
 - `hooks.after_create`: shell script or null
 - `hooks.before_run`: shell script or null
 - `hooks.after_run`: shell script or null
 - `hooks.before_remove`: shell script or null
-- `hooks.timeout_ms`: integer, default `60000`
+- `hooks.timeout_ms`: integer, default `300000`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
@@ -857,12 +881,12 @@ Execution contract:
   `cwd`.
 - On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
   conforming default.
-- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
+- Hook timeout uses `hooks.timeout_ms`; default: `300000 ms`.
 - Log hook start, failures, and timeouts.
 
 Failure semantics:
 
-- `after_create` failure or timeout is fatal to workspace creation.
+- `after_create` failure or timeout is fatal to workspace creation, and removes the newly created workspace.
 - `before_run` failure or timeout is fatal to the current run attempt.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
@@ -933,8 +957,13 @@ semantics):
 {"id":1,"method":"initialize","params":{"clientInfo":{"name":"symphony","version":"1.0"},"capabilities":{}}}
 {"method":"initialized","params":{}}
 {"id":2,"method":"thread/start","params":{"approvalPolicy":"<implementation-defined>","sandbox":"<implementation-defined>","cwd":"/abs/workspace"}}
-{"id":3,"method":"turn/start","params":{"threadId":"<thread-id>","input":[{"type":"text","text":"<rendered prompt-or-continuation-guidance>"}],"cwd":"/abs/workspace","title":"ABC-123: Example","approvalPolicy":"<implementation-defined>","sandboxPolicy":{"type":"<implementation-defined>"}}}
+{"id":3,"method":"turn/start","params":{"threadId":"<thread-id>","input":[{"type":"text","text":"<rendered prompt-or-continuation-guidance>"},{"type":"image","url":"https://uploads.linear.app/..."}],"cwd":"/abs/workspace","title":"ABC-123: Example","approvalPolicy":"<implementation-defined>","sandboxPolicy":{"type":"<implementation-defined>"}}}
 ```
+
+Note: exact `input` item variants are owned by Codex schema versions. Implementations should
+inspect generated schema definitions (for example `TurnStartParams` -> `UserInput`) and emit
+image/text items that match the installed app-server build instead of hard-coding assumptions
+across versions.
 
 1. `initialize` request
    - Params include:
@@ -954,8 +983,9 @@ semantics):
 4. `turn/start` request
    - Params include:
      - `threadId`
-     - `input` = single text item containing rendered prompt for the first turn, or continuation
-       guidance for later turns on the same thread
+     - `input` = one or more user-input items. At minimum include a text item with rendered prompt
+       or continuation guidance. If image forwarding is enabled, include additional image items using
+       the shape accepted by the installed Codex app-server schema.
      - `cwd`
      - `title` = `<issue.identifier>: <issue.title>`
      - `approvalPolicy` = implementation-defined turn approval policy value
@@ -1669,6 +1699,8 @@ Possible hardening measures include:
   dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
 - Narrowing the optional `linear_graphql` tool so it can only read or mutate data inside the
   intended project scope, rather than exposing general workspace-wide tracker access.
+- If forwarding issue image URLs to Codex, enforce strict allowlists (hosts/schemes), cap image
+  count/size expectations, and avoid forwarding local file paths or internal-only network targets.
 - Reducing the set of client-side tools, credentials, filesystem paths, and network destinations
   available to the agent to the minimum needed for the workflow.
 
@@ -2078,7 +2110,7 @@ Use the same validation profiles as Section 17:
 - Issue tracker client with candidate fetch + state refresh + terminal fetch
 - Workspace manager with sanitized per-issue workspaces
 - Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
-- Hook timeout config (`hooks.timeout_ms`, default `60000`)
+- Hook timeout config (`hooks.timeout_ms`, default `300000`)
 - Coding-agent app-server subprocess client with JSON line protocol
 - Codex launch command config (`codex.command`, default `codex app-server`)
 - Strict prompt rendering with `issue` and `attempt` variables

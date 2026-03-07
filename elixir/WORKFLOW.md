@@ -13,11 +13,22 @@ tracker:
     - Canceled
     - Duplicate
     - Done
+  image_inputs:
+    # Default is enabled; set false to disable forwarding.
+    enabled: true
+    # Optional when enabled: cap forwarded image count per turn.
+    max_images: 3
+    # Optional when enabled: allowlist hosts for issue image URLs.
+    allowed_hosts:
+      - uploads.linear.app
+    # Optional when enabled: keep HTTPS-only by default.
+    allow_http: false
 polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
+  timeout_ms: 300000
   after_create: |
     git clone --depth 1 https://github.com/openai/symphony .
     if command -v mise >/dev/null 2>&1; then
@@ -60,6 +71,8 @@ Description:
 {% else %}
 No description provided.
 {% endif %}
+
+If issue images are attached as turn inputs, inspect them and use their concrete visual details in your analysis and validation notes.
 
 Instructions:
 
