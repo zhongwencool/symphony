@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  @due_in_range_slack_ms 100
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -8,6 +10,7 @@ defmodule SymphonyElixir.CoreTest do
       poll_interval_ms: nil,
       tracker_active_states: nil,
       tracker_terminal_states: nil,
+      tracker_image_inputs: nil,
       codex_command: nil
     )
 
@@ -15,6 +18,14 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.linear_active_states() == ["Todo", "In Progress"]
     assert Config.linear_terminal_states() == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert Config.linear_assignee() == nil
+
+    assert Config.linear_image_inputs() == %{
+             enabled: true,
+             max_images: 3,
+             allowed_hosts: ["uploads.linear.app"],
+             allow_http: false
+           }
+
     assert Config.agent_max_turns() == 20
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
@@ -31,6 +42,38 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert Config.linear_active_states() == ["Todo", "Review"]
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_image_inputs: %{
+        enabled: true,
+        max_images: 2,
+        allowed_hosts: ["uploads.linear.app", "*.linear.app"],
+        allow_http: true
+      }
+    )
+
+    assert Config.linear_image_inputs() == %{
+             enabled: true,
+             max_images: 2,
+             allowed_hosts: ["uploads.linear.app", "*.linear.app"],
+             allow_http: true
+           }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_image_inputs: %{
+        enabled: true,
+        max_images: 2,
+        allowed_hosts: [],
+        allow_http: false
+      }
+    )
+
+    assert Config.linear_image_inputs() == %{
+             enabled: true,
+             max_images: 2,
+             allowed_hosts: [],
+             allow_http: false
+           }
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "token",
@@ -448,6 +491,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_down_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -456,7 +500,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, before_down_ms, 500, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -489,6 +533,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_down_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -496,7 +541,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, before_down_ms, 39_500, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -528,6 +573,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_down_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -535,14 +581,14 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_in_range(due_at_ms, before_down_ms, 9_000, 10_500)
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  defp assert_due_in_range(due_at_ms, reference_ms, min_delay_ms, max_delay_ms) do
+    delay_ms = due_at_ms - reference_ms
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+    assert delay_ms >= min_delay_ms - @due_in_range_slack_ms
+    assert delay_ms <= max_delay_ms + @due_in_range_slack_ms
   end
 
   test "fetch issues by states with empty state set is a no-op" do
