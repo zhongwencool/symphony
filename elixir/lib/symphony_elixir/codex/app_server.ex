@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, IssueImages}
 
   @initialize_id 1
   @thread_start_id 2
@@ -12,6 +12,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @issue_image_fetch_timeout 20_000
+  @max_issue_image_bytes 2_000_000
 
   @type session :: %{
           port: port(),
@@ -85,7 +87,10 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    image_fetcher =
+      Keyword.get(opts, :image_fetcher, &fetch_issue_image_data_url/1)
+
+    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, image_fetcher) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -251,18 +256,24 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+  defp start_turn(
+         port,
+         thread_id,
+         prompt,
+         issue,
+         workspace,
+         approval_policy,
+         turn_sandbox_policy,
+         image_fetcher
+       ) do
+    input = build_turn_input(prompt, issue, image_fetcher)
+
     send_message(port, %{
       "method" => "turn/start",
       "id" => @turn_start_id,
       "params" => %{
         "threadId" => thread_id,
-        "input" => [
-          %{
-            "type" => "text",
-            "text" => prompt
-          }
-        ],
+        "input" => input,
         "cwd" => Path.expand(workspace),
         "title" => "#{issue.identifier}: #{issue.title}",
         "approvalPolicy" => approval_policy,
@@ -275,6 +286,228 @@ defmodule SymphonyElixir.Codex.AppServer do
       other -> other
     end
   end
+
+  defp build_turn_input(prompt, issue, image_fetcher)
+       when is_binary(prompt) and is_function(image_fetcher, 1) do
+    text_input = [%{"type" => "text", "text" => prompt}]
+    text_input ++ build_issue_image_inputs(issue, image_fetcher)
+  end
+
+  defp build_issue_image_inputs(issue, image_fetcher) when is_map(issue) and is_function(image_fetcher, 1) do
+    config = Config.linear_image_inputs()
+
+    if config.enabled do
+      issue
+      |> Map.get(:description)
+      |> IssueImages.extract_urls(
+        allowed_hosts: config.allowed_hosts,
+        max_images: nil,
+        allow_http: config.allow_http
+      )
+      |> collect_issue_image_inputs(config.max_images, image_fetcher)
+    else
+      []
+    end
+  end
+
+  defp build_issue_image_inputs(_issue, _image_fetcher), do: []
+
+  defp collect_issue_image_inputs(image_urls, max_images, image_fetcher)
+       when is_list(image_urls) and is_integer(max_images) and max_images > 0 and is_function(image_fetcher, 1) do
+    {inputs, _count} =
+      Enum.reduce_while(image_urls, {[], 0}, fn image_url, {inputs, count} ->
+        case to_issue_image_input(image_url, image_fetcher) do
+          %{} = input ->
+            accumulate_issue_image_input(input, inputs, count, max_images)
+
+          nil ->
+            {:cont, {inputs, count}}
+        end
+      end)
+
+    Enum.reverse(inputs)
+  end
+
+  defp collect_issue_image_inputs(_image_urls, _max_images, _image_fetcher), do: []
+
+  defp accumulate_issue_image_input(input, inputs, count, max_images) when is_map(input) do
+    next_count = count + 1
+    next_inputs = [input | inputs]
+    maybe_finish_issue_image_inputs(next_inputs, next_count, max_images)
+  end
+
+  defp maybe_finish_issue_image_inputs(inputs, count, max_images) when count >= max_images,
+    do: {:halt, {inputs, count}}
+
+  defp maybe_finish_issue_image_inputs(inputs, count, _max_images), do: {:cont, {inputs, count}}
+
+  defp to_issue_image_input(image_url, image_fetcher) when is_binary(image_url) do
+    case image_fetcher.(image_url) do
+      {:ok, data_url} when is_binary(data_url) and data_url != "" ->
+        %{"type" => "image", "url" => data_url}
+
+      {:error, reason} ->
+        Logger.warning("Skipping issue image input from #{image_url_for_log(image_url)}: #{inspect(reason)}")
+        nil
+
+      other ->
+        Logger.warning("Skipping issue image input from #{image_url_for_log(image_url)}: unexpected result #{inspect(other)}")
+        nil
+    end
+  end
+
+  defp to_issue_image_input(_image_url, _image_fetcher), do: nil
+
+  defp fetch_issue_image_data_url(image_url) when is_binary(image_url) do
+    with {:ok, response} <- request_issue_image(image_url, []),
+         {:ok, response} <- maybe_retry_issue_image_with_linear_auth(image_url, response),
+         :ok <- ensure_issue_image_success_status(response.status),
+         {:ok, content_type} <- extract_issue_image_content_type(response.headers),
+         {:ok, image_body} <- normalize_issue_image_body(response.body),
+         :ok <- validate_issue_image_size(image_body) do
+      {:ok, "data:#{content_type};base64," <> Base.encode64(image_body)}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp request_issue_image(image_url, headers) when is_binary(image_url) and is_list(headers) do
+    Req.get(image_url,
+      headers: headers,
+      connect_options: [timeout: @issue_image_fetch_timeout],
+      receive_timeout: @issue_image_fetch_timeout
+    )
+  end
+
+  defp maybe_retry_issue_image_with_linear_auth(image_url, %Req.Response{status: 401} = response) do
+    case linear_auth_header_for_image_url(image_url) do
+      {:ok, header} -> request_issue_image(image_url, [header])
+      {:error, _reason} -> {:ok, response}
+    end
+  end
+
+  defp maybe_retry_issue_image_with_linear_auth(_image_url, %Req.Response{} = response), do: {:ok, response}
+
+  defp linear_auth_header_for_image_url(image_url) when is_binary(image_url) do
+    host =
+      image_url
+      |> URI.parse()
+      |> Map.get(:host)
+      |> normalize_host()
+
+    with true <- linear_auth_host?(host),
+         {:ok, token} <- linear_image_auth_token() do
+      {:ok, {"Authorization", token}}
+    else
+      false -> {:error, :host_not_linear}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp linear_auth_host?(host) when is_binary(host) do
+    host == "linear.app" or String.ends_with?(host, ".linear.app")
+  end
+
+  defp linear_auth_host?(_host), do: false
+
+  defp linear_image_auth_token do
+    case Config.linear_api_token() do
+      token when is_binary(token) and token != "" -> {:ok, token}
+      _ -> {:error, :missing_linear_api_token}
+    end
+  end
+
+  defp ensure_issue_image_success_status(status) when is_integer(status) and status in 200..299, do: :ok
+  defp ensure_issue_image_success_status(status) when is_integer(status), do: {:error, {:image_fetch_http_status, status}}
+
+  defp extract_issue_image_content_type(headers) when is_list(headers) or is_map(headers) do
+    content_type =
+      Enum.find_value(headers, fn
+        {name, value} ->
+          if normalize_header_name(name) == "content-type" do
+            header_value_to_string(value)
+          else
+            nil
+          end
+
+        _ ->
+          nil
+      end)
+
+    case normalize_image_content_type(content_type) do
+      {:ok, normalized} -> {:ok, normalized}
+      :error when is_nil(content_type) -> {:error, :missing_image_content_type}
+      :error -> {:error, {:invalid_image_content_type, content_type}}
+    end
+  end
+
+  defp extract_issue_image_content_type(_headers), do: {:error, :missing_image_content_type}
+
+  defp normalize_header_name(name) do
+    name
+    |> to_string()
+    |> String.downcase()
+  end
+
+  defp normalize_image_content_type(value) when is_binary(value) do
+    value
+    |> String.split(";", parts: 2)
+    |> List.first()
+    |> String.trim()
+    |> String.downcase()
+    |> case do
+      <<"image/", _::binary>> = content_type -> {:ok, content_type}
+      _ -> :error
+    end
+  end
+
+  defp normalize_image_content_type(_value), do: :error
+
+  defp header_value_to_string([value | _]), do: header_value_to_string(value)
+  defp header_value_to_string(value) when is_binary(value), do: value
+
+  defp header_value_to_string(value) when is_list(value) do
+    if List.ascii_printable?(value) do
+      List.to_string(value)
+    else
+      nil
+    end
+  end
+
+  defp header_value_to_string(_value), do: nil
+
+  defp normalize_issue_image_body(body) when is_binary(body) and body != "", do: {:ok, body}
+  defp normalize_issue_image_body(body) when is_binary(body), do: {:error, :empty_image_body}
+  defp normalize_issue_image_body(body), do: {:error, {:non_binary_image_body, body}}
+
+  defp validate_issue_image_size(image_body) when byte_size(image_body) <= @max_issue_image_bytes, do: :ok
+
+  defp validate_issue_image_size(image_body) do
+    {:error, {:image_too_large, byte_size(image_body), @max_issue_image_bytes}}
+  end
+
+  defp image_url_for_log(image_url) when is_binary(image_url) do
+    case URI.parse(image_url) do
+      %URI{scheme: scheme, host: host, path: path} when is_binary(scheme) and is_binary(host) ->
+        sanitized_path = path || ""
+        "#{scheme}://#{host}#{sanitized_path}"
+
+      %URI{host: host, path: path} when is_binary(host) ->
+        sanitized_path = path || ""
+        "#{host}#{sanitized_path}"
+
+      _ ->
+        image_url
+    end
+  end
+
+  defp normalize_host(host) when is_binary(host) do
+    host
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_host(_host), do: nil
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
     receive_loop(port, on_message, Config.codex_turn_timeout_ms(), "", tool_executor, auto_approve_requests)

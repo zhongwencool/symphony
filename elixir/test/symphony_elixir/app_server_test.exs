@@ -39,6 +39,367 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server includes issue image inputs when tracker.image_inputs is enabled" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-image-input-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-901")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-image-input.trace")
+      previous_trace = System.get_env("SYMP_TEST_IMAGE_TRACE")
+      data_url = "data:image/png;base64,ZmFrZS1pbWFnZS1kYXRh"
+
+      {:ok, image_fetch_calls} = Agent.start_link(fn -> [] end)
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_IMAGE_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_IMAGE_TRACE")
+        end
+
+        if Process.alive?(image_fetch_calls) do
+          Agent.stop(image_fetch_calls)
+        end
+      end)
+
+      System.put_env("SYMP_TEST_IMAGE_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_IMAGE_TRACE:-/tmp/codex-image-input.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-901"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-901"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        tracker_image_inputs: %{
+          enabled: true,
+          max_images: 1,
+          allowed_hosts: ["uploads.linear.app"],
+          allow_http: false
+        }
+      )
+
+      issue = %Issue{
+        id: "issue-image-input",
+        identifier: "MT-901",
+        title: "Image input support",
+        description: """
+        ![allowed-1](https://uploads.linear.app/demo/a.png)
+        ![blocked](https://example.com/demo/b.png)
+        ![allowed-2](https://uploads.linear.app/demo/c.png)
+        """,
+        state: "In Progress",
+        url: "https://example.org/issues/MT-901",
+        labels: ["backend"]
+      }
+
+      image_fetcher = fn image_url ->
+        Agent.update(image_fetch_calls, fn calls -> [image_url | calls] end)
+        {:ok, data_url}
+      end
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue, image_fetcher: image_fetcher)
+
+      turn_start_payload =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.find_value(fn line ->
+          if String.starts_with?(line, "JSON:") do
+            payload =
+              line
+              |> String.trim_leading("JSON:")
+              |> Jason.decode!()
+
+            if payload["id"] == 3, do: payload, else: nil
+          end
+        end)
+
+      assert is_map(turn_start_payload)
+
+      assert get_in(turn_start_payload, ["params", "input"]) == [
+               %{"type" => "text", "text" => "Prompt text"},
+               %{"type" => "image", "url" => data_url}
+             ]
+
+      assert Agent.get(image_fetch_calls, &Enum.reverse/1) == [
+               "https://uploads.linear.app/demo/a.png"
+             ]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server skips issue images that fail to fetch and forwards later valid images" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-image-fetch-fallback-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-902")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-image-fetch-fallback.trace")
+      previous_trace = System.get_env("SYMP_TEST_IMAGE_TRACE")
+      fallback_data_url = "data:image/png;base64,ZmFsbGJhY2staW1hZ2U="
+      {:ok, image_fetch_calls} = Agent.start_link(fn -> [] end)
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_IMAGE_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_IMAGE_TRACE")
+        end
+
+        if Process.alive?(image_fetch_calls) do
+          Agent.stop(image_fetch_calls)
+        end
+      end)
+
+      System.put_env("SYMP_TEST_IMAGE_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_IMAGE_TRACE:-/tmp/codex-image-fetch-fallback.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-902"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-902"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        tracker_image_inputs: %{
+          enabled: true,
+          max_images: 1,
+          allowed_hosts: ["uploads.linear.app"],
+          allow_http: false
+        }
+      )
+
+      issue = %Issue{
+        id: "issue-image-fetch-fallback",
+        identifier: "MT-902",
+        title: "Image input fallback support",
+        description: """
+        ![first](https://uploads.linear.app/demo/a.png)
+        ![second](https://uploads.linear.app/demo/b.png)
+        """,
+        state: "In Progress",
+        url: "https://example.org/issues/MT-902",
+        labels: ["backend"]
+      }
+
+      image_fetcher = fn image_url ->
+        Agent.update(image_fetch_calls, fn calls -> [image_url | calls] end)
+
+        case image_url do
+          "https://uploads.linear.app/demo/a.png" -> {:error, :unauthorized}
+          "https://uploads.linear.app/demo/b.png" -> {:ok, fallback_data_url}
+        end
+      end
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue, image_fetcher: image_fetcher)
+
+      turn_start_payload =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.find_value(fn line ->
+          if String.starts_with?(line, "JSON:") do
+            payload =
+              line
+              |> String.trim_leading("JSON:")
+              |> Jason.decode!()
+
+            if payload["id"] == 3, do: payload, else: nil
+          end
+        end)
+
+      assert is_map(turn_start_payload)
+
+      assert get_in(turn_start_payload, ["params", "input"]) == [
+               %{"type" => "text", "text" => "Prompt text"},
+               %{"type" => "image", "url" => fallback_data_url}
+             ]
+
+      assert Agent.get(image_fetch_calls, &Enum.reverse/1) == [
+               "https://uploads.linear.app/demo/a.png",
+               "https://uploads.linear.app/demo/b.png"
+             ]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fetches issue images via Req responses with map headers" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-image-fetch-live-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-903")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-image-fetch-live.trace")
+      previous_trace = System.get_env("SYMP_TEST_IMAGE_TRACE")
+      image_body = "fake-png-body"
+      image_url = start_test_image_server!(200, "image/png", image_body)
+      expected_data_url = "data:image/png;base64,#{Base.encode64(image_body)}"
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_IMAGE_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_IMAGE_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_IMAGE_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_IMAGE_TRACE:-/tmp/codex-image-fetch-live.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-903"}}}'
+            ;;
+          4)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-903"}}}'
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        tracker_image_inputs: %{
+          enabled: true,
+          max_images: 1,
+          allowed_hosts: ["127.0.0.1"],
+          allow_http: true
+        }
+      )
+
+      issue = %Issue{
+        id: "issue-image-fetch-live",
+        identifier: "MT-903",
+        title: "Image input live fetch support",
+        description: "![live](#{image_url})",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-903",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue)
+
+      turn_start_payload =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.find_value(fn line ->
+          if String.starts_with?(line, "JSON:") do
+            payload =
+              line
+              |> String.trim_leading("JSON:")
+              |> Jason.decode!()
+
+            if payload["id"] == 3, do: payload, else: nil
+          end
+        end)
+
+      assert is_map(turn_start_payload)
+
+      assert get_in(turn_start_payload, ["params", "input"]) == [
+               %{"type" => "text", "text" => "Prompt text"},
+               %{"type" => "image", "url" => expected_data_url}
+             ]
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(
@@ -1053,6 +1414,69 @@ defmodule SymphonyElixir.AppServerTest do
       assert log =~ "Codex turn stream output: warning: this is stderr noise"
     after
       File.rm_rf(test_root)
+    end
+  end
+
+  defp start_test_image_server!(status, content_type, body)
+       when is_integer(status) and is_binary(content_type) and is_binary(body) do
+    {:ok, listen_socket} =
+      :gen_tcp.listen(0, [:binary, packet: :raw, active: false, reuseaddr: true, ip: {127, 0, 0, 1}])
+
+    {:ok, port} = :inet.port(listen_socket)
+
+    server_pid =
+      spawn_link(fn ->
+        accept_test_image_requests(listen_socket, status, content_type, body)
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(server_pid) do
+        Process.exit(server_pid, :normal)
+      end
+
+      :gen_tcp.close(listen_socket)
+    end)
+
+    "http://127.0.0.1:#{port}/image.png"
+  end
+
+  defp accept_test_image_requests(listen_socket, status, content_type, body) do
+    case :gen_tcp.accept(listen_socket) do
+      {:ok, socket} ->
+        serve_test_image_request(socket, status, content_type, body)
+        accept_test_image_requests(listen_socket, status, content_type, body)
+
+      {:error, :closed} ->
+        :ok
+    end
+  end
+
+  defp serve_test_image_request(socket, status, content_type, body) do
+    _ = recv_test_request(socket, "")
+
+    response = [
+      "HTTP/1.1 ",
+      Integer.to_string(status),
+      " OK\r\ncontent-type: ",
+      content_type,
+      "\r\ncontent-length: ",
+      Integer.to_string(byte_size(body)),
+      "\r\nconnection: close\r\n\r\n",
+      body
+    ]
+
+    :ok = :gen_tcp.send(socket, response)
+    :gen_tcp.close(socket)
+  end
+
+  defp recv_test_request(socket, buffer) do
+    if String.contains?(buffer, "\r\n\r\n") do
+      {:ok, buffer}
+    else
+      case :gen_tcp.recv(socket, 0, 1_000) do
+        {:ok, chunk} -> recv_test_request(socket, buffer <> chunk)
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 end
