@@ -254,27 +254,21 @@ defmodule SymphonyElixir.Workspace do
   defp cleanup_failed_new_workspace(_workspace, _issue_context, _created?, _worker_host, _reason), do: :ok
 
   defp cleanup_failed_workspace(workspace, issue_context, nil) do
-    Logger.warning(
-      "Cleaning failed workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local"
-    )
+    Logger.warning("Cleaning failed workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     case File.rm_rf(workspace) do
       {:ok, _paths} ->
         :ok
 
       {:error, path, reason} ->
-        Logger.warning(
-          "Failed to clean workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local path=#{path} reason=#{inspect(reason)}"
-        )
+        Logger.warning("Failed to clean workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local path=#{path} reason=#{inspect(reason)}")
 
         :ok
     end
   end
 
   defp cleanup_failed_workspace(workspace, issue_context, worker_host) when is_binary(worker_host) do
-    Logger.warning(
-      "Cleaning failed workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}"
-    )
+    Logger.warning("Cleaning failed workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
     script =
       [
@@ -295,9 +289,7 @@ defmodule SymphonyElixir.Workspace do
         :ok
 
       {:error, reason} ->
-        Logger.warning(
-          "Failed to clean workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host} reason=#{inspect(reason)}"
-        )
+        Logger.warning("Failed to clean workspace after after_create failure #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host} reason=#{inspect(reason)}")
 
         :ok
     end

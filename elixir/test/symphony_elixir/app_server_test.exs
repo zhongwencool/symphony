@@ -76,7 +76,6 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-
   test "app server includes issue image inputs when tracker.image_inputs is enabled" do
     test_root =
       Path.join(
@@ -544,7 +543,6 @@ defmodule SymphonyElixir.AppServerTest do
       File.rm_rf(test_root)
     end
   end
-
 
   test "app server marks request-for-input events as a hard failure" do
     test_root =
