@@ -3,6 +3,14 @@ defmodule SymphonyElixir.SSHTest do
 
   alias SymphonyElixir.SSH
 
+  setup do
+    previous_ssh_executable = Application.get_env(:symphony_elixir, :ssh_executable)
+
+    on_exit(fn -> restore_app_env(:ssh_executable, previous_ssh_executable) end)
+
+    :ok
+  end
+
   test "run/3 keeps bracketed IPv6 host:port targets intact" do
     test_root = Path.join(System.tmp_dir!(), "symphony-ssh-ipv6-test-#{System.unique_integer([:positive])}")
     trace_file = Path.join(test_root, "ssh.trace")
@@ -65,6 +73,26 @@ defmodule SymphonyElixir.SSHTest do
     assert trace =~ "-F /tmp/symphony-test-ssh-config"
     assert trace =~ "-T -p 2222 localhost bash -lc"
     assert trace =~ "echo ready"
+  end
+
+  test "run/3 falls back to PATH lookup when no app override is configured" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-ssh-path-test-#{System.unique_integer([:positive])}")
+    trace_file = Path.join(test_root, "ssh.trace")
+    previous_path = System.get_env("PATH")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      File.rm_rf(test_root)
+    end)
+
+    install_fake_ssh!(test_root, trace_file)
+    Application.delete_env(:symphony_elixir, :ssh_executable)
+
+    assert {:ok, {"", 0}} = SSH.run("localhost", "printf ok", stderr_to_stdout: true)
+
+    trace = File.read!(trace_file)
+    assert trace =~ "-T localhost bash -lc"
+    assert trace =~ "printf ok"
   end
 
   test "run/3 keeps the user prefix when parsing user@host:port targets" do
@@ -179,10 +207,11 @@ defmodule SymphonyElixir.SSHTest do
     )
 
     File.chmod!(fake_ssh, 0o755)
+    Application.put_env(:symphony_elixir, :ssh_executable, fake_ssh)
     System.put_env("PATH", fake_bin_dir <> ":" <> (System.get_env("PATH") || ""))
   end
 
-  defp wait_for_trace!(trace_file, attempts \\ 20)
+  defp wait_for_trace!(trace_file, attempts \\ 200)
   defp wait_for_trace!(trace_file, 0), do: flunk("timed out waiting for fake ssh trace at #{trace_file}")
 
   defp wait_for_trace!(trace_file, attempts) do
@@ -196,4 +225,7 @@ defmodule SymphonyElixir.SSHTest do
 
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 end

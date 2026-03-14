@@ -2,7 +2,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   use SymphonyElixir.TestSupport
   alias Ecto.Changeset
   alias SymphonyElixir.Config.Schema
-  alias SymphonyElixir.Config.Schema.{Codex, StringOrMap}
+  alias SymphonyElixir.Config.Schema.{Codex, StringOrMap, Tracker}
+  alias SymphonyElixir.Config.Schema.Tracker.ImageInputs
   alias SymphonyElixir.Linear.Client
 
   test "workspace bootstrap can be implemented in after_create hook" do
@@ -987,6 +988,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:ok, %{"a" => 1}} = StringOrMap.dump(%{"a" => 1})
     assert :error = StringOrMap.dump(123)
 
+    assert_raise Ecto.CastError, fn ->
+      Tracker.changeset(%Tracker{}, nil)
+    end
+
+    assert_raise Ecto.CastError, fn ->
+      ImageInputs.changeset(%ImageInputs{}, nil)
+    end
+
+    image_inputs_changeset = ImageInputs.changeset(%ImageInputs{}, %{enabled: true})
+
+    assert image_inputs_changeset.valid?
+
+    assert Schema.normalize_csv_string_list(nil) == nil
+    assert Schema.normalize_csv_string_list(" , ") == []
+    assert Schema.normalize_csv_string_list(["  keep  "], trim?: false) == ["  keep  "]
     assert Schema.normalize_state_limits(nil) == %{}
 
     assert Schema.normalize_state_limits(%{"In Progress" => 2, todo: 1}) == %{
@@ -1243,10 +1259,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_ssh_executable = Application.get_env(:symphony_elixir, :ssh_executable)
 
     on_exit(fn ->
       restore_env("PATH", previous_path)
       restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+
+      if is_nil(previous_ssh_executable) do
+        Application.delete_env(:symphony_elixir, :ssh_executable)
+      else
+        Application.put_env(:symphony_elixir, :ssh_executable, previous_ssh_executable)
+      end
     end)
 
     try do
@@ -1274,6 +1297,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       """)
 
       File.chmod!(fake_ssh, 0o755)
+      Application.put_env(:symphony_elixir, :ssh_executable, fake_ssh)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,

@@ -396,24 +396,26 @@ defmodule SymphonyElixir.Config.Schema do
 
   @doc false
   @spec normalize_csv_string_list(term(), keyword()) :: [String.t()] | term()
-  def normalize_csv_string_list(value, opts \\ [])
+  def normalize_csv_string_list(value, opts \\ []) do
+    do_normalize_csv_string_list(value, opts)
+  end
 
-  def normalize_csv_string_list(nil, _opts), do: nil
+  defp do_normalize_csv_string_list(nil, _opts), do: nil
 
-  def normalize_csv_string_list(value, opts) when is_binary(value) do
+  defp do_normalize_csv_string_list(value, opts) when is_binary(value) do
     value
     |> String.split(",", trim: true)
     |> Enum.map(&normalize_csv_string_item(&1, opts))
     |> Enum.reject(&is_nil/1)
   end
 
-  def normalize_csv_string_list(values, opts) when is_list(values) do
+  defp do_normalize_csv_string_list(values, opts) when is_list(values) do
     values
     |> Enum.map(&normalize_csv_string_item(&1, opts))
     |> Enum.reject(&is_nil/1)
   end
 
-  def normalize_csv_string_list(value, _opts), do: value
+  defp do_normalize_csv_string_list(value, _opts), do: value
 
   @doc false
   @spec normalize_state_limits(nil | map()) :: map()

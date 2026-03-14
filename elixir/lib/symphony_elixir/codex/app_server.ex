@@ -262,111 +262,39 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp prepare_codex_agents_home(source_home, launch_home) do
     source_agents = Path.join(source_home, ".agents")
+    dest_agents = Path.join(launch_home, ".agents")
 
-    if File.dir?(source_agents) do
-      dest_agents = Path.join(launch_home, ".agents")
-
-      with :ok <- File.mkdir_p(dest_agents),
-           {:ok, entries} <- File.ls(source_agents) do
-        Enum.reduce_while(entries, :ok, fn entry, :ok ->
-          src = Path.join(source_agents, entry)
-          dest = Path.join(dest_agents, entry)
-
-          result =
-            case entry do
-              "skills" -> prepare_filtered_skills_dir(src, dest)
-              _ -> link_codex_home_path(src, dest)
-            end
-
-          case result do
-            :ok -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
+    prepare_optional_codex_home_dir(source_agents, dest_agents, fn src, dest, entry ->
+      case entry do
+        "skills" -> prepare_filtered_skills_dir(src, dest)
+        _ -> link_codex_home_path(src, dest)
       end
-    else
-      :ok
-    end
+    end)
   end
 
   defp prepare_codex_config_home(source_home, launch_home) do
     source_codex = Path.join(source_home, ".codex")
+    dest_codex = Path.join(launch_home, ".codex")
 
-    if File.dir?(source_codex) do
-      dest_codex = Path.join(launch_home, ".codex")
-
-      with :ok <- File.mkdir_p(dest_codex),
-           {:ok, entries} <- File.ls(source_codex) do
-        Enum.reduce_while(entries, :ok, fn entry, :ok ->
-          src = Path.join(source_codex, entry)
-          dest = Path.join(dest_codex, entry)
-
-          result =
-            case entry do
-              "config.toml" -> sanitize_codex_config(src, dest)
-              _ -> link_codex_home_path(src, dest)
-            end
-
-          case result do
-            :ok -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
+    prepare_optional_codex_home_dir(source_codex, dest_codex, fn src, dest, entry ->
+      case entry do
+        "config.toml" -> sanitize_codex_config(src, dest)
+        _ -> link_codex_home_path(src, dest)
       end
-    else
-      :ok
-    end
+    end)
   end
 
   defp prepare_filtered_skills_dir(source_skills, dest_skills) do
-    if File.dir?(source_skills) do
-      with :ok <- File.mkdir_p(dest_skills),
-           {:ok, entries} <- File.ls(source_skills) do
-        Enum.reduce_while(entries, :ok, fn entry, :ok ->
-          src = Path.join(source_skills, entry)
-          dest = Path.join(dest_skills, entry)
-
-          case mirror_valid_skill(src, dest) do
-            :ok -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, reason}}
-          end
-        end)
-      end
-    else
-      :ok
-    end
+    prepare_optional_codex_home_dir(source_skills, dest_skills, fn src, dest, _entry ->
+      mirror_valid_skill(src, dest)
+    end)
   end
 
   defp mirror_valid_skill(source_skill, dest_skill) do
-    with true <- File.dir?(source_skill) or {:error, :skip_non_directory},
-         {:ok, entries} <- File.ls(source_skill) do
-      invalid_entries = Enum.filter(entries, &broken_symlink?(Path.join(source_skill, &1)))
-
-      case invalid_entries do
-        [] ->
-          with :ok <- File.mkdir_p(dest_skill) do
-            Enum.reduce_while(entries, :ok, fn entry, :ok ->
-              case link_codex_home_path(Path.join(source_skill, entry), Path.join(dest_skill, entry)) do
-                :ok -> {:cont, :ok}
-                {:error, reason} -> {:halt, {:error, reason}}
-              end
-            end)
-          end
-
-        broken_entries ->
-          Logger.warning("Skipping invalid Codex skill path=#{source_skill} broken_entries=#{inspect(Enum.sort(broken_entries))}")
-
-          :ok
-      end
+    if File.dir?(source_skill) do
+      do_mirror_valid_skill(source_skill, dest_skill)
     else
-      {:error, :skip_non_directory} ->
-        :ok
-
-      false ->
-        :ok
-
-      {:error, reason} ->
-        {:error, {:skill_prepare_failed, source_skill, reason}}
+      :ok
     end
   end
 
@@ -392,31 +320,89 @@ defmodule SymphonyElixir.Codex.AppServer do
     {lines, _skip_prefix} =
       content
       |> String.split("\n", trim: false)
-      |> Enum.reduce({[], nil}, fn line, {acc, skip_prefix} ->
-        case codex_config_table_name(line) do
-          {:ok, table_name} ->
-            cond do
-              launch_home_mcp_server_table?(table_name) ->
-                {acc, table_name}
-
-              skipped_launch_home_subtable?(table_name, skip_prefix) ->
-                {acc, skip_prefix}
-
-              true ->
-                {[line | acc], nil}
-            end
-
-          :error ->
-            if is_binary(skip_prefix) do
-              {acc, skip_prefix}
-            else
-              {[line | acc], nil}
-            end
-        end
-      end)
+      |> Enum.reduce({[], nil}, &strip_launch_home_mcp_server_line/2)
 
     Enum.reverse(lines)
     |> Enum.join("\n")
+  end
+
+  defp prepare_optional_codex_home_dir(source_dir, dest_dir, entry_fun) do
+    if File.dir?(source_dir) do
+      link_codex_home_entries(source_dir, dest_dir, entry_fun)
+    else
+      :ok
+    end
+  end
+
+  defp link_codex_home_entries(source_dir, dest_dir, entry_fun) do
+    with :ok <- File.mkdir_p(dest_dir),
+         {:ok, entries} <- File.ls(source_dir) do
+      Enum.reduce_while(entries, :ok, fn entry, :ok ->
+        reduce_codex_home_entry(source_dir, dest_dir, entry, entry_fun)
+      end)
+    end
+  end
+
+  defp reduce_codex_home_entry(source_dir, dest_dir, entry, entry_fun) do
+    src = Path.join(source_dir, entry)
+    dest = Path.join(dest_dir, entry)
+
+    case entry_fun.(src, dest, entry) do
+      :ok -> {:cont, :ok}
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
+  end
+
+  defp do_mirror_valid_skill(source_skill, dest_skill) do
+    with {:ok, entries} <- File.ls(source_skill),
+         :ok <- validate_skill_entries(source_skill, entries),
+         :ok <- File.mkdir_p(dest_skill) do
+      link_codex_home_entries(source_skill, dest_skill, fn src, dest, _entry ->
+        link_codex_home_path(src, dest)
+      end)
+    else
+      {:skip, broken_entries} ->
+        Logger.warning("Skipping invalid Codex skill path=#{source_skill} broken_entries=#{inspect(broken_entries)}")
+        :ok
+
+      {:error, reason} ->
+        {:error, {:skill_prepare_failed, source_skill, reason}}
+    end
+  end
+
+  defp validate_skill_entries(source_skill, entries) do
+    case Enum.filter(entries, &broken_symlink?(Path.join(source_skill, &1))) do
+      [] -> :ok
+      broken_entries -> {:skip, Enum.sort(broken_entries)}
+    end
+  end
+
+  defp strip_launch_home_mcp_server_line(line, {acc, skip_prefix}) do
+    case codex_config_table_name(line) do
+      {:ok, table_name} -> strip_launch_home_mcp_server_table(line, table_name, acc, skip_prefix)
+      :error -> strip_launch_home_mcp_server_content(line, acc, skip_prefix)
+    end
+  end
+
+  defp strip_launch_home_mcp_server_table(line, table_name, acc, skip_prefix) do
+    cond do
+      launch_home_mcp_server_table?(table_name) ->
+        {acc, table_name}
+
+      skipped_launch_home_subtable?(table_name, skip_prefix) ->
+        {acc, skip_prefix}
+
+      true ->
+        {[line | acc], nil}
+    end
+  end
+
+  defp strip_launch_home_mcp_server_content(line, acc, skip_prefix) do
+    if is_binary(skip_prefix) do
+      {acc, skip_prefix}
+    else
+      {[line | acc], nil}
+    end
   end
 
   defp codex_config_table_name(line) when is_binary(line) do
@@ -1419,7 +1405,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp response_stage(@initialize_id), do: :initialize
   defp response_stage(@thread_start_id), do: :thread_start
   defp response_stage(@turn_start_id), do: :turn_start
-  defp response_stage(request_id), do: {:response, request_id}
 
   defp response_timeout_error(stage, timeout_ms, pending_line, recent_output) do
     timeout_context = timeout_context_lines(pending_line, recent_output)

@@ -1845,10 +1845,17 @@ defmodule SymphonyElixir.AppServerTest do
 
     previous_path = System.get_env("PATH")
     previous_trace = System.get_env("SYMP_TEST_SSH_TRACE")
+    previous_ssh_executable = Application.get_env(:symphony_elixir, :ssh_executable)
 
     on_exit(fn ->
       restore_env("PATH", previous_path)
       restore_env("SYMP_TEST_SSH_TRACE", previous_trace)
+
+      if is_nil(previous_ssh_executable) do
+        Application.delete_env(:symphony_elixir, :ssh_executable)
+      else
+        Application.put_env(:symphony_elixir, :ssh_executable, previous_ssh_executable)
+      end
     end)
 
     try do
@@ -1892,6 +1899,7 @@ defmodule SymphonyElixir.AppServerTest do
       """)
 
       File.chmod!(fake_ssh, 0o755)
+      Application.put_env(:symphony_elixir, :ssh_executable, fake_ssh)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "/remote/workspaces",
