@@ -68,7 +68,8 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_id: issue_id_from_entries(running, retry),
       status: issue_status(running, retry),
       workspace: %{
-        path: Path.join(Config.workspace_root(), issue_identifier)
+        path: workspace_path(issue_identifier, running, retry),
+        host: workspace_host(running, retry)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -112,6 +113,8 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
       state: entry.state,
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
       session_id: entry.session_id,
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
@@ -134,12 +137,16 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_identifier: entry.identifier,
       attempt: entry.attempt,
       due_at: due_at_iso8601(entry.due_in_ms),
-      error: entry.error
+      error: entry.error,
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path)
     }
   end
 
   defp running_issue_payload(running) do
     %{
+      worker_host: Map.get(running, :worker_host),
+      workspace_path: Map.get(running, :workspace_path),
       session_id: running.session_id,
       turn_count: Map.get(running, :turn_count, 0),
       state: running.state,
@@ -160,7 +167,9 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       attempt: retry.attempt,
       due_at: retry_due_at(retry),
-      error: retry.error
+      error: retry.error,
+      worker_host: Map.get(retry, :worker_host),
+      workspace_path: Map.get(retry, :workspace_path)
     }
   end
 
@@ -246,6 +255,16 @@ defmodule SymphonyElixirWeb.Presenter do
       }
     ]
     |> Enum.reject(&is_nil(&1.timestamp))
+  end
+
+  defp workspace_path(issue_identifier, running, retry) do
+    (running && Map.get(running, :workspace_path)) ||
+      (retry && Map.get(retry, :workspace_path)) ||
+      Path.join(Config.settings!().workspace.root, issue_identifier)
+  end
+
+  defp workspace_host(running, retry) do
+    (running && Map.get(running, :worker_host)) || (retry && Map.get(retry, :worker_host))
   end
 
   defp recent_event_payload(event) do

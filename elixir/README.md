@@ -14,7 +14,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 ## How it works
 
 1. Polls Linear for candidate work
-2. Creates an isolated workspace per issue
+2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
 4. Sends a workflow prompt to Codex
@@ -121,8 +121,9 @@ Notes:
   example `30000`) so Codex has enough time to finish startup and `thread/start` negotiation.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
-- Supported `codex.turn_sandbox_policy.type` values: `dangerFullAccess`, `readOnly`,
-  `externalSandbox`, `workspaceWrite`.
+- When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
+  unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
+  Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
@@ -163,7 +164,9 @@ codex:
   command: "$CODEX_BIN app-server --model gpt-5.3-codex"
 ```
 
-- If `WORKFLOW.md` is missing or has invalid YAML, startup and scheduling are halted until fixed.
+- If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
+- If a later reload fails, Symphony keeps running with the last known good workflow and logs the
+  reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/issues/<issue_identifier>`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
@@ -193,6 +196,36 @@ approval/input, or approaching a stalled restart.
 ```bash
 make all
 ```
+
+Run the real external end-to-end test only when you want Symphony to create disposable Linear
+resources and launch a real `codex app-server` session:
+
+```bash
+cd elixir
+export LINEAR_API_KEY=...
+make e2e
+```
+
+Optional environment variables:
+
+- `SYMPHONY_LIVE_LINEAR_TEAM_KEY` defaults to `SYME2E`
+- `SYMPHONY_LIVE_SSH_WORKER_HOSTS` uses those SSH hosts when set, as a comma-separated list
+
+`make e2e` runs two live scenarios:
+- one with a local worker
+- one with SSH workers
+
+If `SYMPHONY_LIVE_SSH_WORKER_HOSTS` is unset, the SSH scenario uses `docker compose` to start two
+disposable SSH workers on `localhost:<port>`. The live test generates a temporary SSH keypair,
+mounts the host `~/.codex/auth.json` into each worker, verifies that Symphony can talk to them
+over real SSH, then runs the same orchestration flow against those worker addresses. This keeps
+the transport representative without depending on long-lived external machines.
+
+Set `SYMPHONY_LIVE_SSH_WORKER_HOSTS` if you want `make e2e` to target real SSH hosts instead.
+
+The live test creates a temporary Linear project and issue, writes a temporary `WORKFLOW.md`, runs
+a real agent turn, verifies the workspace side effect, requires Codex to comment on and close the
+Linear issue, then marks the project completed so the run remains visible in Linear.
 
 ## FAQ
 

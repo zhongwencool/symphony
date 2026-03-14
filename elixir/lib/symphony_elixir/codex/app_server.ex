@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, IssueImages}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, IssueImages, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -17,7 +17,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @max_issue_image_bytes 2_000_000
 
   @type session :: %{
-          launch_home: Path.t(),
+          launch_home: Path.t() | nil,
           port: port(),
           metadata: map(),
           approval_policy: String.t() | map(),
@@ -25,12 +25,13 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
-          workspace: Path.t()
+          workspace: Path.t(),
+          worker_host: String.t() | nil
         }
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
-    with {:ok, session} <- start_session(workspace) do
+    with {:ok, session} <- start_session(workspace, opts) do
       try do
         run_turn(session, prompt, issue, opts)
       after
@@ -39,15 +40,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  @spec start_session(Path.t()) :: {:ok, session()} | {:error, term()}
-  def start_session(workspace) do
-    with :ok <- validate_workspace_cwd(workspace),
-         {:ok, {port, launch_home}} <- start_port(workspace) do
-      metadata = port_metadata(port)
-      expanded_workspace = Path.expand(workspace)
+  @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
+  def start_session(workspace, opts \\ []) do
+    worker_host = Keyword.get(opts, :worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+    with {:ok, validated_workspace} <- validate_workspace_cwd(workspace, worker_host),
+         {:ok, {port, launch_home}} <- start_port(validated_workspace, worker_host) do
+      metadata = port_metadata(port, worker_host)
+
+      with {:ok, session_policies} <- session_policies(validated_workspace, worker_host),
+           {:ok, thread_id} <- do_start_session(port, validated_workspace, session_policies) do
         {:ok,
          %{
            launch_home: launch_home,
@@ -58,7 +60,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
-           workspace: expanded_workspace
+           workspace: validated_workspace,
+           worker_host: worker_host
          }}
       else
         {:error, reason} ->
@@ -151,25 +154,49 @@ defmodule SymphonyElixir.Codex.AppServer do
     cleanup_codex_launch_home(launch_home)
   end
 
-  defp validate_workspace_cwd(workspace) when is_binary(workspace) do
-    workspace_path = Path.expand(workspace)
-    workspace_root = Path.expand(Config.workspace_root())
+  defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
+    expanded_workspace = Path.expand(workspace)
+    expanded_root = Path.expand(workspace_root())
+    expanded_root_prefix = expanded_root <> "/"
 
-    root_prefix = workspace_root <> "/"
+    with {:ok, canonical_workspace} <- PathSafety.canonicalize(expanded_workspace),
+         {:ok, canonical_root} <- PathSafety.canonicalize(expanded_root) do
+      canonical_root_prefix = canonical_root <> "/"
 
-    cond do
-      workspace_path == workspace_root ->
-        {:error, {:invalid_workspace_cwd, :workspace_root, workspace_path}}
+      cond do
+        canonical_workspace == canonical_root ->
+          {:error, {:invalid_workspace_cwd, :workspace_root, canonical_workspace}}
 
-      not String.starts_with?(workspace_path <> "/", root_prefix) ->
-        {:error, {:invalid_workspace_cwd, :outside_workspace_root, workspace_path, workspace_root}}
+        String.starts_with?(canonical_workspace <> "/", canonical_root_prefix) ->
+          {:ok, canonical_workspace}
 
-      true ->
-        :ok
+        String.starts_with?(expanded_workspace <> "/", expanded_root_prefix) ->
+          {:error, {:invalid_workspace_cwd, :symlink_escape, expanded_workspace, canonical_root}}
+
+        true ->
+          {:error, {:invalid_workspace_cwd, :outside_workspace_root, canonical_workspace, canonical_root}}
+      end
+    else
+      {:error, {:path_canonicalize_failed, path, reason}} ->
+        {:error, {:invalid_workspace_cwd, :path_unreadable, path, reason}}
     end
   end
 
-  defp start_port(workspace) do
+  defp validate_workspace_cwd(workspace, worker_host)
+       when is_binary(workspace) and is_binary(worker_host) do
+    cond do
+      String.trim(workspace) == "" ->
+        {:error, {:invalid_workspace_cwd, :empty_remote_workspace, worker_host}}
+
+      String.contains?(workspace, ["\n", "\r", <<0>>]) ->
+        {:error, {:invalid_workspace_cwd, :invalid_remote_workspace, worker_host, workspace}}
+
+      true ->
+        {:ok, workspace}
+    end
+  end
+
+  defp start_port(workspace, nil) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -183,7 +210,7 @@ defmodule SymphonyElixir.Codex.AppServer do
               :binary,
               :exit_status,
               :stderr_to_stdout,
-              args: [~c"-c", String.to_charlist(Config.codex_command())],
+              args: [~c"-lc", String.to_charlist(codex_command())],
               cd: String.to_charlist(workspace),
               env: codex_port_env(launch_home),
               line: @port_line_bytes
@@ -192,6 +219,15 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         {:ok, {port, launch_home}}
       end
+    end
+  end
+
+  defp start_port(workspace, worker_host) when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace)
+
+    case SSH.start_port(worker_host, remote_command, line: @port_line_bytes) do
+      {:ok, port} -> {:ok, {port, nil}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -422,13 +458,27 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp cleanup_codex_launch_home(_path), do: :ok
 
-  defp port_metadata(port) when is_port(port) do
-    case :erlang.port_info(port, :os_pid) do
-      {:os_pid, os_pid} ->
-        %{codex_app_server_pid: to_string(os_pid)}
+  defp remote_launch_command(workspace) when is_binary(workspace) do
+    [
+      "cd #{shell_escape(workspace)}",
+      "exec #{codex_command()}"
+    ]
+    |> Enum.join(" && ")
+  end
 
-      _ ->
-        %{}
+  defp port_metadata(port, worker_host) when is_port(port) do
+    base_metadata =
+      case :erlang.port_info(port, :os_pid) do
+        {:os_pid, os_pid} ->
+          %{codex_app_server_pid: to_string(os_pid)}
+
+        _ ->
+          %{}
+      end
+
+    case worker_host do
+      host when is_binary(host) -> Map.put(base_metadata, :worker_host, host)
+      _ -> base_metadata
     end
   end
 
@@ -456,8 +506,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp session_policies(workspace) do
+  defp session_policies(workspace, nil) do
     Config.codex_runtime_settings(workspace)
+  end
+
+  defp session_policies(workspace, worker_host) when is_binary(worker_host) do
+    Config.codex_runtime_settings(workspace, remote: true)
   end
 
   defp do_start_session(port, workspace, session_policies) do
@@ -474,7 +528,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "params" => %{
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
-        "cwd" => Path.expand(workspace),
+        "cwd" => workspace,
         "dynamicTools" => DynamicTool.tool_specs()
       }
     })
@@ -509,7 +563,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "params" => %{
         "threadId" => thread_id,
         "input" => input,
-        "cwd" => Path.expand(workspace),
+        "cwd" => workspace,
         "title" => "#{issue.identifier}: #{issue.title}",
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
@@ -529,7 +583,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp build_issue_image_inputs(issue, image_fetcher) when is_map(issue) and is_function(image_fetcher, 1) do
-    config = Config.linear_image_inputs()
+    config = linear_image_inputs()
 
     if config.enabled do
       issue
@@ -646,7 +700,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp linear_auth_host?(_host), do: false
 
   defp linear_image_auth_token do
-    case Config.linear_api_token() do
+    case linear_api_token() do
       token when is_binary(token) and token != "" -> {:ok, token}
       _ -> {:error, :missing_linear_api_token}
     end
@@ -745,7 +799,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp normalize_host(_host), do: nil
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
-    receive_loop(port, on_message, Config.codex_turn_timeout_ms(), "", tool_executor, auto_approve_requests)
+    receive_loop(port, on_message, codex_turn_timeout_ms(), "", tool_executor, auto_approve_requests)
   end
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
@@ -1292,7 +1346,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       port,
       request_id,
       response_stage(request_id),
-      Config.codex_read_timeout_ms(),
+      codex_read_timeout_ms(),
       "",
       []
     )
@@ -1444,7 +1498,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp metadata_from_message(port, payload) do
-    port |> port_metadata() |> maybe_set_usage(payload)
+    port |> port_metadata(nil) |> maybe_set_usage(payload)
   end
 
   defp maybe_set_usage(metadata, payload) when is_map(payload) do
@@ -1458,6 +1512,43 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
+
+  defp workspace_root do
+    Config.settings!().workspace.root
+  end
+
+  defp codex_command do
+    Config.settings!().codex.command
+  end
+
+  defp codex_turn_timeout_ms do
+    Config.settings!().codex.turn_timeout_ms
+  end
+
+  defp codex_read_timeout_ms do
+    Config.settings!().codex.read_timeout_ms
+  end
+
+  defp linear_api_token do
+    Config.settings!().tracker.api_key
+  end
+
+  defp linear_image_inputs do
+    image_inputs =
+      Config.settings!().tracker
+      |> Map.get(:image_inputs, %{})
+
+    %{
+      enabled: Map.get(image_inputs, :enabled, true),
+      max_images: Map.get(image_inputs, :max_images, 3),
+      allowed_hosts: Map.get(image_inputs, :allowed_hosts, ["uploads.linear.app"]),
+      allow_http: Map.get(image_inputs, :allow_http, false)
+    }
+  end
+
+  defp shell_escape(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
 
   defp default_on_message(_message), do: :ok
 
