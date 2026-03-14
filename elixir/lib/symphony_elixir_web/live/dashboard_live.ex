@@ -51,7 +51,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
               Operations Dashboard
             </h1>
             <p class="hero-copy">
-              Current state, retry pressure, token usage, and orchestration health for the active Symphony runtime.
+              Current state, runtime progress, retry pressure, token usage, and orchestration health for the active Symphony runtime.
             </p>
           </div>
 
@@ -92,6 +92,24 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Waiting</p>
+            <p class="metric-value numeric"><%= @payload.counts.waiting %></p>
+            <p class="metric-detail">Agents blocked on approval or user input.</p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Stalled</p>
+            <p class="metric-value numeric"><%= @payload.counts.stalled %></p>
+            <p class="metric-detail">Agents with no recent codex activity before restart timeout.</p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Active now</p>
+            <p class="metric-value numeric"><%= @payload.counts.active_now %></p>
+            <p class="metric-detail">Agents with an update in the last 15 seconds.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -121,7 +139,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Running sessions</h2>
-              <p class="section-copy">Active issues, last known agent activity, and token usage.</p>
+              <p class="section-copy">Active issues, current phase, recent agent activity, and token usage.</p>
             </div>
           </div>
 
@@ -135,6 +153,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   <col style="width: 8rem;" />
                   <col style="width: 7.5rem;" />
                   <col style="width: 8.5rem;" />
+                  <col style="width: 22rem;" />
                   <col />
                   <col style="width: 10rem;" />
                 </colgroup>
@@ -144,7 +163,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <th>State</th>
                     <th>Session</th>
                     <th>Runtime / turns</th>
-                    <th>Codex update</th>
+                    <th>Progress</th>
+                    <th>Latest event</th>
                     <th>Tokens</th>
                   </tr>
                 </thead>
@@ -153,7 +173,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <a class="issue-link" href={"/issues/#{entry.issue_identifier}"}>Issue details</a>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON API</a>
                       </div>
                     </td>
                     <td>
@@ -179,6 +200,39 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                     </td>
                     <td class="numeric"><%= format_runtime_and_turns(entry.started_at, entry.turn_count, @now) %></td>
+                    <td>
+                      <div class="detail-stack">
+                        <div class="progress-header">
+                          <span class={progress_badge_class(entry.progress)}>
+                            <%= progress_phase_label(entry.progress.phase) %>
+                          </span>
+                        </div>
+                        <span
+                          class="event-text"
+                          title={entry.progress.label || "n/a"}
+                        ><%= entry.progress.label || "n/a" %></span>
+                        <span class="muted event-meta">
+                          <%= progress_meta(entry.progress, @now) %>
+                        </span>
+
+                        <details :if={entry.recent_events != []} class="event-details">
+                          <summary>Recent events</summary>
+                          <ul class="event-timeline">
+                            <li :for={event <- entry.recent_events}>
+                              <span class={timeline_phase_class(event.phase)}>
+                                <%= progress_phase_label(event.phase) %>
+                              </span>
+                              <span class="timeline-copy" title={event.message || event.event || "n/a"}>
+                                <%= event.message || event.event || "n/a" %>
+                              </span>
+                              <span class="timeline-time muted mono numeric">
+                                <%= relative_time_label(event.at, @now) %>
+                              </span>
+                            </li>
+                          </ul>
+                        </details>
+                      </div>
+                    </td>
                     <td>
                       <div class="detail-stack">
                         <span
@@ -232,7 +286,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <a class="issue-link" href={"/issues/#{entry.issue_identifier}"}>Issue details</a>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON API</a>
                       </div>
                     </td>
                     <td><%= entry.attempt %></td>
@@ -299,6 +354,26 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp runtime_seconds_from_started_at(_started_at, _now), do: 0
 
+  defp relative_time_label(nil, _now), do: "n/a"
+
+  defp relative_time_label(timestamp, %DateTime{} = now) when is_binary(timestamp) do
+    case DateTime.from_iso8601(timestamp) do
+      {:ok, parsed, _offset} -> format_relative_seconds(DateTime.diff(now, parsed, :second))
+      _ -> timestamp
+    end
+  end
+
+  defp relative_time_label(_timestamp, _now), do: "n/a"
+
+  defp format_relative_seconds(seconds) when is_integer(seconds) do
+    cond do
+      seconds <= 0 -> "just now"
+      seconds < 60 -> "#{seconds}s ago"
+      seconds < 3_600 -> "#{div(seconds, 60)}m ago"
+      true -> "#{div(seconds, 3_600)}h ago"
+    end
+  end
+
   defp format_int(value) when is_integer(value) do
     value
     |> Integer.to_string()
@@ -320,6 +395,42 @@ defmodule SymphonyElixirWeb.DashboardLive do
       true -> base
     end
   end
+
+  defp progress_badge_class(%{stalled: true}), do: "state-badge state-badge-danger"
+
+  defp progress_badge_class(%{waiting_on: waiting_on}) when waiting_on in ["approval", "input"] do
+    "state-badge state-badge-warning"
+  end
+
+  defp progress_badge_class(_progress), do: "state-badge state-badge-active"
+
+  defp timeline_phase_class("stalled"), do: "timeline-phase timeline-phase-danger"
+  defp timeline_phase_class(phase) when phase in ["waiting_approval", "waiting_input"], do: "timeline-phase timeline-phase-warning"
+  defp timeline_phase_class(_phase), do: "timeline-phase timeline-phase-active"
+
+  defp progress_phase_label(nil), do: "Unknown"
+  defp progress_phase_label("starting"), do: "Starting"
+  defp progress_phase_label("planning"), do: "Planning"
+  defp progress_phase_label("executing"), do: "Executing"
+  defp progress_phase_label("validating"), do: "Validating"
+  defp progress_phase_label("waiting_approval"), do: "Waiting approval"
+  defp progress_phase_label("waiting_input"), do: "Waiting input"
+  defp progress_phase_label("stalled"), do: "Stalled"
+  defp progress_phase_label(phase), do: phase |> to_string() |> String.replace("_", " ") |> String.capitalize()
+
+  defp progress_meta(progress, now) do
+    [
+      progress.updated_at && "Last active #{relative_time_label(progress.updated_at, now)}",
+      waiting_on_copy(progress.waiting_on),
+      progress.stalled && "restart timeout exceeded"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" · ")
+  end
+
+  defp waiting_on_copy("approval"), do: "waiting on approval"
+  defp waiting_on_copy("input"), do: "waiting on input"
+  defp waiting_on_copy(_waiting_on), do: nil
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)

@@ -11,11 +11,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @max_timeout_context_lines 5
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @issue_image_fetch_timeout 20_000
   @max_issue_image_bytes 2_000_000
 
   @type session :: %{
+          launch_home: Path.t(),
           port: port(),
           metadata: map(),
           approval_policy: String.t() | map(),
@@ -40,7 +42,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace) do
     with :ok <- validate_workspace_cwd(workspace),
-         {:ok, port} <- start_port(workspace) do
+         {:ok, {port, launch_home}} <- start_port(workspace) do
       metadata = port_metadata(port)
       expanded_workspace = Path.expand(workspace)
 
@@ -48,6 +50,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
          %{
+           launch_home: launch_home,
            port: port,
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
@@ -60,6 +63,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       else
         {:error, reason} ->
           stop_port(port)
+          cleanup_codex_launch_home(launch_home)
           {:error, reason}
       end
     end
@@ -142,8 +146,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
+  def stop_session(%{port: port, launch_home: launch_home}) when is_port(port) do
     stop_port(port)
+    cleanup_codex_launch_home(launch_home)
   end
 
   defp validate_workspace_cwd(workspace) when is_binary(workspace) do
@@ -170,22 +175,252 @@ defmodule SymphonyElixir.Codex.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.codex_command())],
-            cd: String.to_charlist(workspace),
-            line: @port_line_bytes
-          ]
-        )
+      with {:ok, launch_home} <- prepare_codex_launch_home() do
+        port =
+          Port.open(
+            {:spawn_executable, String.to_charlist(executable)},
+            [
+              :binary,
+              :exit_status,
+              :stderr_to_stdout,
+              args: [~c"-c", String.to_charlist(Config.codex_command())],
+              cd: String.to_charlist(workspace),
+              env: codex_port_env(launch_home),
+              line: @port_line_bytes
+            ]
+          )
 
-      {:ok, port}
+        {:ok, {port, launch_home}}
+      end
     end
   end
+
+  defp prepare_codex_launch_home do
+    case current_home_dir() do
+      home when is_binary(home) and home != "" ->
+        launch_home = Path.join(System.tmp_dir!(), "symphony-codex-home-#{unique_launch_home_suffix()}")
+
+        with :ok <- File.mkdir_p(launch_home),
+             :ok <- prepare_codex_config_home(home, launch_home),
+             :ok <- prepare_codex_agents_home(home, launch_home) do
+          {:ok, launch_home}
+        else
+          {:error, reason} ->
+            cleanup_codex_launch_home(launch_home)
+            {:error, {:codex_launch_home_prepare_failed, reason}}
+        end
+
+      _ ->
+        {:error, :home_not_found}
+    end
+  end
+
+  defp current_home_dir do
+    System.get_env("HOME") || System.user_home()
+  end
+
+  defp unique_launch_home_suffix do
+    random_suffix = Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
+    "#{System.system_time(:microsecond)}-#{random_suffix}"
+  end
+
+  defp prepare_codex_agents_home(source_home, launch_home) do
+    source_agents = Path.join(source_home, ".agents")
+
+    if File.dir?(source_agents) do
+      dest_agents = Path.join(launch_home, ".agents")
+
+      with :ok <- File.mkdir_p(dest_agents),
+           {:ok, entries} <- File.ls(source_agents) do
+        Enum.reduce_while(entries, :ok, fn entry, :ok ->
+          src = Path.join(source_agents, entry)
+          dest = Path.join(dest_agents, entry)
+
+          result =
+            case entry do
+              "skills" -> prepare_filtered_skills_dir(src, dest)
+              _ -> link_codex_home_path(src, dest)
+            end
+
+          case result do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp prepare_codex_config_home(source_home, launch_home) do
+    source_codex = Path.join(source_home, ".codex")
+
+    if File.dir?(source_codex) do
+      dest_codex = Path.join(launch_home, ".codex")
+
+      with :ok <- File.mkdir_p(dest_codex),
+           {:ok, entries} <- File.ls(source_codex) do
+        Enum.reduce_while(entries, :ok, fn entry, :ok ->
+          src = Path.join(source_codex, entry)
+          dest = Path.join(dest_codex, entry)
+
+          result =
+            case entry do
+              "config.toml" -> sanitize_codex_config(src, dest)
+              _ -> link_codex_home_path(src, dest)
+            end
+
+          case result do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp prepare_filtered_skills_dir(source_skills, dest_skills) do
+    if File.dir?(source_skills) do
+      with :ok <- File.mkdir_p(dest_skills),
+           {:ok, entries} <- File.ls(source_skills) do
+        Enum.reduce_while(entries, :ok, fn entry, :ok ->
+          src = Path.join(source_skills, entry)
+          dest = Path.join(dest_skills, entry)
+
+          case mirror_valid_skill(src, dest) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+        end)
+      end
+    else
+      :ok
+    end
+  end
+
+  defp mirror_valid_skill(source_skill, dest_skill) do
+    with true <- File.dir?(source_skill) or {:error, :skip_non_directory},
+         {:ok, entries} <- File.ls(source_skill) do
+      invalid_entries = Enum.filter(entries, &broken_symlink?(Path.join(source_skill, &1)))
+
+      case invalid_entries do
+        [] ->
+          with :ok <- File.mkdir_p(dest_skill) do
+            Enum.reduce_while(entries, :ok, fn entry, :ok ->
+              case link_codex_home_path(Path.join(source_skill, entry), Path.join(dest_skill, entry)) do
+                :ok -> {:cont, :ok}
+                {:error, reason} -> {:halt, {:error, reason}}
+              end
+            end)
+          end
+
+        broken_entries ->
+          Logger.warning("Skipping invalid Codex skill path=#{source_skill} broken_entries=#{inspect(Enum.sort(broken_entries))}")
+
+          :ok
+      end
+    else
+      {:error, :skip_non_directory} ->
+        :ok
+
+      false ->
+        :ok
+
+      {:error, reason} ->
+        {:error, {:skill_prepare_failed, source_skill, reason}}
+    end
+  end
+
+  defp broken_symlink?(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :symlink}} -> not File.exists?(path)
+      _ -> false
+    end
+  end
+
+  defp sanitize_codex_config(source, dest) do
+    with true <- File.exists?(source) or {:error, :missing_source},
+         {:ok, content} <- File.read(source),
+         :ok <- File.write(dest, strip_launch_home_mcp_servers(content)) do
+      :ok
+    else
+      {:error, :missing_source} -> :ok
+      {:error, reason} -> {:error, {:codex_config_prepare_failed, source, reason}}
+    end
+  end
+
+  defp strip_launch_home_mcp_servers(content) when is_binary(content) do
+    {lines, _skip_prefix} =
+      content
+      |> String.split("\n", trim: false)
+      |> Enum.reduce({[], nil}, fn line, {acc, skip_prefix} ->
+        case codex_config_table_name(line) do
+          {:ok, table_name} ->
+            cond do
+              launch_home_mcp_server_table?(table_name) ->
+                {acc, table_name}
+
+              skipped_launch_home_subtable?(table_name, skip_prefix) ->
+                {acc, skip_prefix}
+
+              true ->
+                {[line | acc], nil}
+            end
+
+          :error ->
+            if is_binary(skip_prefix) do
+              {acc, skip_prefix}
+            else
+              {[line | acc], nil}
+            end
+        end
+      end)
+
+    Enum.reverse(lines)
+    |> Enum.join("\n")
+  end
+
+  defp codex_config_table_name(line) when is_binary(line) do
+    case Regex.run(~r/^\s*\[([^\]]+)\]\s*$/, line, capture: :all_but_first) do
+      [table_name] -> {:ok, String.trim(table_name)}
+      _ -> :error
+    end
+  end
+
+  defp launch_home_mcp_server_table?("mcp_servers.linear"), do: true
+  defp launch_home_mcp_server_table?(_table_name), do: false
+
+  defp skipped_launch_home_subtable?(table_name, skip_prefix)
+       when is_binary(table_name) and is_binary(skip_prefix) do
+    String.starts_with?(table_name, skip_prefix <> ".")
+  end
+
+  defp skipped_launch_home_subtable?(_table_name, _skip_prefix), do: false
+
+  defp link_codex_home_path(source, dest) do
+    if File.exists?(source) do
+      File.ln_s(source, dest)
+    else
+      :ok
+    end
+  end
+
+  defp codex_port_env(launch_home) do
+    [
+      {~c"HOME", String.to_charlist(launch_home)},
+      {~c"CODEX_HOME", String.to_charlist(Path.join(launch_home, ".codex"))}
+    ]
+  end
+
+  defp cleanup_codex_launch_home(path) when is_binary(path) and path != "" do
+    File.rm_rf(path)
+    :ok
+  end
+
+  defp cleanup_codex_launch_home(_path), do: :ok
 
   defp port_metadata(port) when is_port(port) do
     case :erlang.port_info(port, :os_pid) do
@@ -1053,27 +1288,49 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp await_response(port, request_id) do
-    with_timeout_response(port, request_id, Config.codex_read_timeout_ms(), "")
+    with_timeout_response(
+      port,
+      request_id,
+      response_stage(request_id),
+      Config.codex_read_timeout_ms(),
+      "",
+      []
+    )
   end
 
-  defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
+  defp with_timeout_response(port, request_id, stage, timeout_ms, pending_line, recent_output) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_response(port, request_id, complete_line, timeout_ms)
+
+        handle_response(
+          port,
+          request_id,
+          stage,
+          complete_line,
+          timeout_ms,
+          recent_output
+        )
 
       {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+        with_timeout_response(
+          port,
+          request_id,
+          stage,
+          timeout_ms,
+          pending_line <> to_string(chunk),
+          recent_output
+        )
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
     after
       timeout_ms ->
-        {:error, :response_timeout}
+        {:error, response_timeout_error(stage, timeout_ms, pending_line, recent_output)}
     end
   end
 
-  defp handle_response(port, request_id, data, timeout_ms) do
+  defp handle_response(port, request_id, stage, data, timeout_ms, recent_output) do
     payload = to_string(data)
 
     case Jason.decode(payload) do
@@ -1088,22 +1345,71 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{} = other} ->
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "")
+
+        with_timeout_response(port, request_id, stage, timeout_ms, "", recent_output)
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
-        with_timeout_response(port, request_id, timeout_ms, "")
+
+        with_timeout_response(
+          port,
+          request_id,
+          stage,
+          timeout_ms,
+          "",
+          remember_timeout_context_line(recent_output, payload)
+        )
+    end
+  end
+
+  defp response_stage(@initialize_id), do: :initialize
+  defp response_stage(@thread_start_id), do: :thread_start
+  defp response_stage(@turn_start_id), do: :turn_start
+  defp response_stage(request_id), do: {:response, request_id}
+
+  defp response_timeout_error(stage, timeout_ms, pending_line, recent_output) do
+    timeout_context = timeout_context_lines(pending_line, recent_output)
+
+    case timeout_context do
+      [] ->
+        {:response_timeout, stage, timeout_ms}
+
+      lines ->
+        {:response_timeout, stage, timeout_ms, lines}
+    end
+  end
+
+  defp timeout_context_lines(pending_line, recent_output) do
+    recent_output = Enum.take(recent_output, -@max_timeout_context_lines)
+
+    case normalize_timeout_context_line(pending_line) do
+      nil -> recent_output
+      line -> Enum.take(recent_output ++ ["[partial] " <> line], -@max_timeout_context_lines)
+    end
+  end
+
+  defp remember_timeout_context_line(recent_output, line) do
+    case normalize_timeout_context_line(line) do
+      nil -> recent_output
+      normalized -> Enum.take(recent_output ++ [normalized], -@max_timeout_context_lines)
+    end
+  end
+
+  defp normalize_timeout_context_line(line) do
+    line
+    |> to_string()
+    |> String.trim()
+    |> String.slice(0, @max_stream_log_bytes)
+    |> case do
+      "" -> nil
+      normalized -> normalized
     end
   end
 
   defp log_non_json_stream_line(data, stream_label) do
-    text =
-      data
-      |> to_string()
-      |> String.trim()
-      |> String.slice(0, @max_stream_log_bytes)
+    text = normalize_timeout_context_line(data)
 
-    if text != "" do
+    if is_binary(text) do
       if String.match?(text, ~r/\b(error|warn|warning|failed|fatal|panic|exception)\b/i) do
         Logger.warning("Codex #{stream_label} output: #{text}")
       else

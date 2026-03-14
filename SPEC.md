@@ -1328,6 +1328,10 @@ should return:
   - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
 - `rate_limits` (latest coding-agent rate limit payload, if available)
 
+Implementations may also include additional derived observability fields per running row (for
+example a current progress phase, wait state, or a bounded recent-event timeline) as long as those
+fields are computed from orchestrator state and remain observability-only.
+
 Recommended snapshot error modes:
 
 - `timeout`
@@ -1410,7 +1414,8 @@ Enablement (extension):
 
 - Host a human-readable dashboard at `/`.
 - The returned document should depict the current state of the system (for example active sessions,
-  retry delays, token consumption, runtime totals, recent events, and health/error indicators).
+  retry delays, token consumption, runtime totals, recent events, derived progress/wait states, and
+  health/error indicators).
 - It is up to the implementation whether this is server-generated HTML or a client-side app that
   consumes the JSON API below.
 

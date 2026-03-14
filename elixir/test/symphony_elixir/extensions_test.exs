@@ -339,10 +339,18 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
+    state_running = List.first(state_payload["running"])
+    state_recent_event = List.first(state_running["recent_events"])
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
+             "counts" => %{
+               "running" => 1,
+               "retrying" => 1,
+               "waiting" => 0,
+               "stalled" => 0,
+               "active_now" => 1
+             },
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -352,8 +360,24 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
-                 "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
-                 "last_event_at" => nil,
+                 "started_at" => state_running["started_at"],
+                 "last_event_at" => state_running["last_event_at"],
+                 "progress" => %{
+                   "phase" => "executing",
+                   "label" => "rendered",
+                   "updated_at" => get_in(state_running, ["progress", "updated_at"]),
+                   "waiting_on" => "none",
+                   "stalled" => false
+                 },
+                 "recent_events" => [
+                   %{
+                     "at" => state_recent_event["at"],
+                     "event" => "notification",
+                     "phase" => "executing",
+                     "waiting_on" => "none",
+                     "message" => "rendered"
+                   }
+                 ],
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
@@ -377,6 +401,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
+    issue_recent_event = List.first(issue_payload["recent_events"])
 
     assert issue_payload == %{
              "issue_identifier" => "MT-HTTP",
@@ -391,12 +416,36 @@ defmodule SymphonyElixir.ExtensionsTest do
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
                "last_message" => "rendered",
-               "last_event_at" => nil,
+               "last_event_at" => issue_payload["running"]["last_event_at"],
+               "progress" => %{
+                 "phase" => "executing",
+                 "label" => "rendered",
+                 "updated_at" => issue_payload["running"] |> get_in(["progress", "updated_at"]),
+                 "waiting_on" => "none",
+                 "stalled" => false
+               },
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
              "retry" => nil,
              "logs" => %{"codex_session_logs" => []},
-             "recent_events" => [],
+             "recent_events" => [
+               %{
+                 "at" => issue_recent_event["at"],
+                 "event" => "notification",
+                 "phase" => "executing",
+                 "waiting_on" => "none",
+                 "message" => "rendered"
+               }
+             ],
+             "timeline" => [
+               %{
+                 "at" => issue_recent_event["at"],
+                 "event" => "notification",
+                 "phase" => "executing",
+                 "waiting_on" => "none",
+                 "message" => "rendered"
+               }
+             ],
              "last_error" => nil,
              "tracked" => %{}
            }
@@ -538,7 +587,9 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "Progress"
+    assert html =~ "Latest event"
+    assert html =~ "Recent events"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -587,6 +638,231 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
   end
 
+  test "issue liveview renders full timeline view" do
+    orchestrator_name = Module.concat(__MODULE__, :IssueLiveOrchestrator)
+    snapshot = static_snapshot()
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/issues/MT-HTTP")
+    assert html =~ "MT-HTTP"
+    assert html =~ "Timeline"
+    assert html =~ "Current activity"
+    assert html =~ "Issue runtime detail"
+    assert html =~ "rendered"
+    assert html =~ "JSON API"
+    assert html =~ Config.workspace_root()
+  end
+
+  test "issue liveview refreshes over pubsub and runtime ticks" do
+    orchestrator_name = Module.concat(__MODULE__, :IssueLiveRefreshOrchestrator)
+    snapshot = static_snapshot()
+
+    {:ok, orchestrator_pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, view, _html} = live(build_conn(), "/issues/MT-HTTP")
+
+    updated_snapshot =
+      put_in(snapshot.running, [
+        %{
+          List.first(snapshot.running)
+          | progress_phase: :planning,
+            progress_label: "plan updated",
+            last_codex_message: %{event: :notification, message: %{payload: %{"method" => "turn/plan/updated", "params" => %{"plan" => [%{"step" => "a"}]}}}},
+            recent_codex_events: [
+              %{
+                event: :notification,
+                message: %{event: :notification, message: %{payload: %{"method" => "turn/plan/updated", "params" => %{"plan" => [%{"step" => "a"}]}}}},
+                timestamp: DateTime.utc_now(),
+                phase: :planning,
+                waiting_on: :none
+              }
+            ],
+            last_codex_timestamp: DateTime.utc_now()
+        }
+      ])
+
+    :sys.replace_state(orchestrator_pid, fn state ->
+      Keyword.put(state, :snapshot, updated_snapshot)
+    end)
+
+    StatusDashboard.notify_update()
+
+    assert_eventually(fn ->
+      html = render(view)
+      html =~ "plan updated" and html =~ "Raw payload" and html =~ "turn/plan/updated"
+    end)
+
+    send(view.pid, :runtime_tick)
+    assert render(view) =~ "Timeline"
+  end
+
+  test "issue liveview renders retry-only timeline" do
+    orchestrator_name = Module.concat(__MODULE__, :IssueRetryLiveOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: %{static_snapshot() | running: []},
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/issues/MT-RETRY")
+    assert html =~ "retrying"
+    assert html =~ "No active runtime progress is available"
+    assert html =~ "retry attempt 2 scheduled"
+    assert html =~ "Retrying"
+    assert html =~ "retry window scheduled"
+  end
+
+  test "issue liveview renders timeline time variants and stalled events" do
+    orchestrator_name = Module.concat(__MODULE__, :IssueTimelineVariantsOrchestrator)
+    now = DateTime.utc_now()
+
+    snapshot = %{
+      static_snapshot()
+      | running: [
+          %{
+            List.first(static_snapshot().running)
+            | recent_codex_events: [
+                %{event: :notification, message: "stalled event", timestamp: DateTime.add(now, -7_200, :second), phase: :stalled, waiting_on: :none},
+                %{event: :notification, message: "minute event", timestamp: DateTime.add(now, -120, :second), phase: :planning, waiting_on: :none},
+                %{event: :notification, message: "second event", timestamp: DateTime.add(now, -30, :second), phase: :executing, waiting_on: :none},
+                %{event: :notification, message: "just now event", timestamp: now, phase: :executing, waiting_on: :none},
+                %{event: :notification, message: "missing timestamp", timestamp: nil, phase: :executing, waiting_on: :none}
+              ]
+          }
+        ]
+    }
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{queued: true, coalesced: false, requested_at: DateTime.utc_now(), operations: ["poll"]}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/issues/MT-HTTP")
+    assert html =~ "just now"
+    assert html =~ "30s ago"
+    assert html =~ "2m ago"
+    assert html =~ "2h ago"
+    assert html =~ "Stalled"
+    assert html =~ "n/a"
+  end
+
+  test "issue liveview renders raw string payload details" do
+    orchestrator_name = Module.concat(__MODULE__, :IssueRawStringPayloadOrchestrator)
+    now = DateTime.utc_now()
+
+    snapshot = %{
+      static_snapshot()
+      | running: [
+          %{
+            List.first(static_snapshot().running)
+            | recent_codex_events: [
+                %{event: :notification, message: %{payload: "raw text payload"}, timestamp: now, phase: :executing, waiting_on: :none}
+              ]
+          }
+        ]
+    }
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{queued: true, coalesced: false, requested_at: now, operations: ["poll"]}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/issues/MT-HTTP")
+    assert html =~ "Raw payload"
+    assert html =~ "raw text payload"
+  end
+
+  test "issue liveview handles invalid retry timestamps" do
+    snapshot = %{
+      static_snapshot()
+      | running: [],
+        retrying: [%{issue_id: "issue-retry", identifier: "MT-RETRY", attempt: 2, due_at: "soon-ish", error: "boom"}]
+    }
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: Module.concat(__MODULE__, :IssueRetryBogusTimeOrchestrator),
+        snapshot: snapshot,
+        refresh: %{queued: true, coalesced: false, requested_at: DateTime.utc_now(), operations: ["poll"]}
+      )
+
+    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :IssueRetryBogusTimeOrchestrator), snapshot_timeout_ms: 50)
+    {:ok, _view, html} = live(build_conn(), "/issues/MT-RETRY")
+    assert html =~ "soon-ish"
+  end
+
+  test "issue liveview handles non-binary retry timestamps" do
+    snapshot = %{
+      static_snapshot()
+      | running: [],
+        retrying: [%{issue_id: "issue-retry", identifier: "MT-RETRY", attempt: 2, due_at: 123, error: "boom"}]
+    }
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: Module.concat(__MODULE__, :IssueRetryIntTimeOrchestrator),
+        snapshot: snapshot,
+        refresh: %{queued: true, coalesced: false, requested_at: DateTime.utc_now(), operations: ["poll"]}
+      )
+
+    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :IssueRetryIntTimeOrchestrator), snapshot_timeout_ms: 50)
+    {:ok, _view, html} = live(build_conn(), "/issues/MT-RETRY")
+    assert html =~ "n/a"
+  end
+
+  test "issue liveview renders unavailable issue state" do
+    start_test_endpoint(
+      orchestrator: Module.concat(__MODULE__, :MissingIssueOrchestrator),
+      snapshot_timeout_ms: 5
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/issues/MT-MISSING")
+    assert html =~ "Issue unavailable"
+    assert html =~ "issue_not_found"
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),
@@ -632,7 +908,14 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "retrying" => 1,
+             "waiting" => 0,
+             "stalled" => 0,
+             "active_now" => 1
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -675,6 +958,8 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp static_snapshot do
+    now = DateTime.utc_now()
+
     %{
       running: [
         %{
@@ -685,12 +970,26 @@ defmodule SymphonyElixir.ExtensionsTest do
           turn_count: 7,
           codex_app_server_pid: nil,
           last_codex_message: "rendered",
-          last_codex_timestamp: nil,
+          last_codex_timestamp: now,
           last_codex_event: :notification,
+          progress_phase: :executing,
+          progress_label: "rendered",
+          progress_updated_at: now,
+          progress_waiting_on: :none,
+          progress_stalled: false,
+          recent_codex_events: [
+            %{
+              event: :notification,
+              message: "rendered",
+              timestamp: now,
+              phase: :executing,
+              waiting_on: :none
+            }
+          ],
           codex_input_tokens: 4,
           codex_output_tokens: 8,
           codex_total_tokens: 12,
-          started_at: DateTime.utc_now()
+          started_at: now
         }
       ],
       retrying: [

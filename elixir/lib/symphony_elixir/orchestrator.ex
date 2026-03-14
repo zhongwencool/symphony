@@ -14,6 +14,7 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @recent_codex_event_limit 20
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -616,6 +617,11 @@ defmodule SymphonyElixir.Orchestrator do
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
+            progress_phase: :starting,
+            progress_label: nil,
+            progress_updated_at: DateTime.utc_now(),
+            progress_waiting_on: :none,
+            recent_codex_events: [],
             codex_app_server_pid: nil,
             codex_input_tokens: 0,
             codex_output_tokens: 0,
@@ -918,6 +924,7 @@ defmodule SymphonyElixir.Orchestrator do
     state = refresh_runtime_config(state)
     now = DateTime.utc_now()
     now_ms = System.monotonic_time(:millisecond)
+    stall_timeout_ms = Config.codex_stall_timeout_ms()
 
     running =
       state.running
@@ -936,6 +943,12 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          progress_phase: Map.get(metadata, :progress_phase, :starting),
+          progress_label: Map.get(metadata, :progress_label),
+          progress_updated_at: progress_updated_at(metadata),
+          progress_waiting_on: Map.get(metadata, :progress_waiting_on, :none),
+          progress_stalled: progress_stalled?(metadata, now, stall_timeout_ms),
+          recent_codex_events: Enum.reverse(Map.get(metadata, :recent_codex_events, [])),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -986,6 +999,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
+    summary = summarize_codex_update(update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
@@ -994,13 +1008,27 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
+    progress_phase = progress_phase_for_update(running_entry, update)
+    progress_waiting_on = progress_waiting_on_for_phase(progress_phase)
+    progress_updated_at = timestamp || Map.get(running_entry, :progress_updated_at)
 
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
-        last_codex_message: summarize_codex_update(update),
+        last_codex_message: summary,
         session_id: session_id_for_update(running_entry.session_id, update),
         last_codex_event: event,
+        progress_phase: progress_phase,
+        progress_label: summary,
+        progress_updated_at: progress_updated_at,
+        progress_waiting_on: progress_waiting_on,
+        recent_codex_events:
+          prepend_recent_codex_event(
+            Map.get(running_entry, :recent_codex_events, []),
+            summary,
+            progress_phase,
+            progress_waiting_on
+          ),
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -1057,6 +1085,116 @@ defmodule SymphonyElixir.Orchestrator do
       timestamp: update[:timestamp]
     }
   end
+
+  defp progress_phase_for_update(_running_entry, %{event: :session_started}), do: :starting
+
+  defp progress_phase_for_update(running_entry, %{event: :approval_auto_approved}) do
+    resume_progress_phase(running_entry)
+  end
+
+  defp progress_phase_for_update(running_entry, %{event: :tool_input_auto_answered}) do
+    resume_progress_phase(running_entry)
+  end
+
+  defp progress_phase_for_update(_running_entry, %{event: :turn_completed}), do: :executing
+  defp progress_phase_for_update(_running_entry, %{event: :turn_ended_with_error}), do: :stalled
+  defp progress_phase_for_update(running_entry, update), do: progress_phase_for_method(running_entry, codex_update_method(update))
+
+  defp progress_phase_for_method(_running_entry, method)
+       when method in ["turn/plan/updated", "item/plan/delta"] do
+    :planning
+  end
+
+  defp progress_phase_for_method(_running_entry, method)
+       when method in [
+              "item/commandExecution/requestApproval",
+              "item/fileChange/requestApproval"
+            ] do
+    :waiting_approval
+  end
+
+  defp progress_phase_for_method(_running_entry, "item/tool/requestUserInput"), do: :waiting_input
+
+  defp progress_phase_for_method(_running_entry, method)
+       when method in [
+              "codex/event/exec_command_begin",
+              "turn/diff/updated",
+              "item/tool/call",
+              "item/started",
+              "item/completed",
+              "item/commandExecution/outputDelta",
+              "item/fileChange/outputDelta"
+            ] do
+    :executing
+  end
+
+  defp progress_phase_for_method(_running_entry, method)
+       when method in [
+              "codex/event/agent_reasoning",
+              "item/reasoning/summaryTextDelta",
+              "item/reasoning/summaryPartAdded",
+              "item/reasoning/textDelta"
+            ] do
+    :planning
+  end
+
+  defp progress_phase_for_method(running_entry, method)
+       when method in ["item/agentMessage/delta", "thread/tokenUsage/updated"] do
+    Map.get(running_entry, :progress_phase, :executing)
+  end
+
+  defp progress_phase_for_method(running_entry, _method) do
+    Map.get(running_entry, :progress_phase, :executing)
+  end
+
+  defp progress_waiting_on_for_phase(:waiting_approval), do: :approval
+  defp progress_waiting_on_for_phase(:waiting_input), do: :input
+  defp progress_waiting_on_for_phase(_phase), do: :none
+
+  defp resume_progress_phase(running_entry) do
+    case Map.get(running_entry, :progress_phase) do
+      phase when phase in [:waiting_approval, :waiting_input, :stalled] -> :executing
+      phase when phase in [:planning, :executing, :validating] -> phase
+      _ -> :executing
+    end
+  end
+
+  defp codex_update_method(%{payload: payload}) when is_map(payload) do
+    payload["method"] || payload[:method]
+  end
+
+  defp codex_update_method(_update), do: nil
+
+  defp prepend_recent_codex_event(events, %{timestamp: timestamp} = summary, phase, waiting_on)
+       when is_list(events) do
+    [
+      %{
+        event: summary.event,
+        message: summary,
+        timestamp: timestamp,
+        phase: phase,
+        waiting_on: waiting_on
+      }
+      | events
+    ]
+    |> Enum.take(@recent_codex_event_limit)
+  end
+
+  defp prepend_recent_codex_event(_events, _summary, _phase, _waiting_on), do: []
+
+  defp progress_updated_at(running_entry) do
+    Map.get(running_entry, :progress_updated_at) || last_activity_timestamp(running_entry)
+  end
+
+  defp progress_stalled?(running_entry, now, timeout_ms)
+       when is_integer(timeout_ms) and timeout_ms > 0 do
+    elapsed_ms = stall_elapsed_ms(running_entry, now)
+
+    Map.get(running_entry, :progress_waiting_on, :none) == :none and
+      is_integer(elapsed_ms) and elapsed_ms > timeout_ms
+  end
+
+  defp progress_stalled?(_running_entry, _now, _timeout_ms), do: false
 
   defp schedule_tick(delay_ms) do
     :timer.send_after(delay_ms, self(), :tick)

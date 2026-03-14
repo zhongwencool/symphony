@@ -100,6 +100,7 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+  read_timeout_ms: 30000
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -116,6 +117,8 @@ Notes:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
+- `codex.read_timeout_ms` defaults to `5000`, but larger local setups often need a higher value (for
+  example `30000`) so Codex has enough time to finish startup and `thread/start` negotiation.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - Supported `codex.turn_sandbox_policy.type` values: `dangerFullAccess`, `readOnly`,
@@ -162,7 +165,7 @@ codex:
 
 - If `WORKFLOW.md` is missing or has invalid YAML, startup and scheduling are halted until fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/issues/<issue_identifier>`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
 ## Web dashboard
 
@@ -172,6 +175,11 @@ The observability UI now runs on a minimal Phoenix stack:
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
+
+The dashboard emphasizes operator-facing runtime visibility rather than ticket-source-of-truth
+progress notes. Running sessions expose the current derived phase, wait state, and a short recent
+event timeline so operators can quickly tell whether an agent is actively progressing, waiting on
+approval/input, or approaching a stalled restart.
 
 ## Project Layout
 

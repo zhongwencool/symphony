@@ -1417,6 +1417,209 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server returns initialize timeout diagnostics with recent Codex output" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-initialize-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-903")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r _line; do
+        printf '%s\\n' 'fatal: skill loader failed during startup' >&2
+        sleep 1
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 750
+      )
+
+      issue = %Issue{
+        id: "issue-initialize-timeout",
+        identifier: "MT-903",
+        title: "Initialize timeout diagnostics",
+        description: "Surface startup timeout context",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-903",
+        labels: ["backend"]
+      }
+
+      result = AppServer.run(workspace, "Prompt text", issue)
+
+      assert match?({:error, {:response_timeout, :initialize, 750}}, result) or
+               match?({:error, {:response_timeout, :initialize, 750, _lines}}, result)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server returns turn start timeout diagnostics with recent Codex output" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-turn-start-timeout-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-904")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-904"}}}'
+            ;;
+          4)
+            printf '%s\\n' 'fatal: waiting for MCP bootstrap' >&2
+            sleep 1
+            ;;
+          *)
+            sleep 1
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 750
+      )
+
+      issue = %Issue{
+        id: "issue-turn-start-timeout",
+        identifier: "MT-904",
+        title: "Turn start timeout diagnostics",
+        description: "Surface turn/start timeout context",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-904",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:response_timeout, :turn_start, 750, lines}} =
+               AppServer.run(workspace, "Prompt text", issue)
+
+      assert Enum.any?(lines, &String.contains?(&1, "fatal: waiting for MCP bootstrap"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server filters invalid global skills from Codex launch home" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-sanitized-home-#{System.unique_integer([:positive])}"
+      )
+
+    previous_home = System.get_env("HOME")
+
+    try do
+      source_home = Path.join(test_root, "source-home")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-905")
+      codex_binary = Path.join(test_root, "fake-codex")
+      broken_skill = Path.join(source_home, ".agents/skills/ui-ux-pro-max")
+
+      on_exit(fn -> restore_env("HOME", previous_home) end)
+
+      File.mkdir_p!(Path.join(source_home, ".codex"))
+      File.mkdir_p!(broken_skill)
+      File.mkdir_p!(workspace)
+
+      File.write!(Path.join(broken_skill, "SKILL.md"), "---\nname: ui-ux-pro-max\n---\n")
+      File.ln_s!(Path.join(test_root, "missing-scripts"), Path.join(broken_skill, "scripts"))
+      File.ln_s!(Path.join(test_root, "missing-data"), Path.join(broken_skill, "data"))
+
+      System.put_env("HOME", source_home)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            if [ -e "$HOME/.agents/skills/ui-ux-pro-max" ]; then
+              printf '%s\\n' 'invalid skill leaked into sanitized home' >&2
+              sleep 1
+            elif [ "${CODEX_HOME:-}" != "$HOME/.codex" ]; then
+              printf '%s\n' 'codex home leaked from parent env' >&2
+              sleep 1
+            else
+              printf '%s\\n' '{"id":1,"result":{}}'
+            fi
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-905"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-905"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 2_000
+      )
+
+      issue = %Issue{
+        id: "issue-sanitized-home",
+        identifier: "MT-905",
+        title: "Skip invalid global skills",
+        description: "Ensure Codex launch home omits broken global skills",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-905",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   defp start_test_image_server!(status, content_type, body)
        when is_integer(status) and is_binary(content_type) and is_binary(body) do
     {:ok, listen_socket} =
