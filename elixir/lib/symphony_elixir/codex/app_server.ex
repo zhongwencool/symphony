@@ -15,6 +15,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @issue_image_fetch_timeout 20_000
   @max_issue_image_bytes 2_000_000
+  @forwarded_env_vars [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+    "GITHUB_TOKEN",
+    "SSH_AUTH_SOCK",
+    "XDG_CONFIG_HOME",
+    "GIT_CONFIG_GLOBAL"
+  ]
+  @forwarded_env_prefixes ["JJ_"]
 
   @type session :: %{
           launch_home: Path.t() | nil,
@@ -197,28 +210,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp start_port(workspace, nil) do
-    executable = System.find_executable("bash")
+    case System.find_executable("bash") do
+      executable when is_binary(executable) ->
+        start_local_port(workspace, executable)
 
-    if is_nil(executable) do
-      {:error, :bash_not_found}
-    else
-      with {:ok, launch_home} <- prepare_codex_launch_home() do
-        port =
-          Port.open(
-            {:spawn_executable, String.to_charlist(executable)},
-            [
-              :binary,
-              :exit_status,
-              :stderr_to_stdout,
-              args: [~c"-lc", String.to_charlist(codex_command())],
-              cd: String.to_charlist(workspace),
-              env: codex_port_env(launch_home),
-              line: @port_line_bytes
-            ]
-          )
-
-        {:ok, {port, launch_home}}
-      end
+      _ ->
+        {:error, :bash_not_found}
     end
   end
 
@@ -231,19 +228,40 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp prepare_codex_launch_home do
+  defp prepare_codex_launch_home(home) when is_binary(home) and home != "" do
+    launch_home = Path.join(System.tmp_dir!(), "symphony-codex-home-#{unique_launch_home_suffix()}")
+
+    with :ok <- File.mkdir_p(launch_home),
+         :ok <- prepare_codex_config_home(home, launch_home),
+         :ok <- prepare_codex_agents_home(home, launch_home) do
+      {:ok, launch_home}
+    else
+      {:error, reason} ->
+        cleanup_codex_launch_home(launch_home)
+        {:error, {:codex_launch_home_prepare_failed, reason}}
+    end
+  end
+
+  defp start_local_port(workspace, executable)
+       when is_binary(workspace) and is_binary(executable) do
     case current_home_dir() do
       home when is_binary(home) and home != "" ->
-        launch_home = Path.join(System.tmp_dir!(), "symphony-codex-home-#{unique_launch_home_suffix()}")
+        with {:ok, launch_home} <- prepare_codex_launch_home(home) do
+          port =
+            Port.open(
+              {:spawn_executable, String.to_charlist(executable)},
+              [
+                :binary,
+                :exit_status,
+                :stderr_to_stdout,
+                args: [~c"-lc", String.to_charlist(codex_command())],
+                cd: String.to_charlist(workspace),
+                env: codex_port_env(launch_home, home),
+                line: @port_line_bytes
+              ]
+            )
 
-        with :ok <- File.mkdir_p(launch_home),
-             :ok <- prepare_codex_config_home(home, launch_home),
-             :ok <- prepare_codex_agents_home(home, launch_home) do
-          {:ok, launch_home}
-        else
-          {:error, reason} ->
-            cleanup_codex_launch_home(launch_home)
-            {:error, {:codex_launch_home_prepare_failed, reason}}
+          {:ok, {port, launch_home}}
         end
 
       _ ->
@@ -430,12 +448,119 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp codex_port_env(launch_home) do
-    [
-      {~c"HOME", String.to_charlist(launch_home)},
-      {~c"CODEX_HOME", String.to_charlist(Path.join(launch_home, ".codex"))}
-    ]
+  defp codex_port_env(launch_home, source_home) do
+    %{}
+    |> put_port_env("HOME", launch_home)
+    |> put_port_env("CODEX_HOME", Path.join(launch_home, ".codex"))
+    |> maybe_put_forwarded_env_vars()
+    |> maybe_put_forwarded_env_prefixes()
+    |> maybe_put_default_port_env("XDG_CONFIG_HOME", xdg_config_home(source_home))
+    |> maybe_put_default_port_env("GIT_CONFIG_GLOBAL", git_config_global(source_home))
+    |> maybe_put_default_port_env("GH_CONFIG_DIR", gh_config_dir(source_home))
+    |> maybe_put_default_port_env("GH_TOKEN", gh_token(source_home))
+    |> Enum.map(fn {key, value} -> {String.to_charlist(key), String.to_charlist(value)} end)
   end
+
+  defp maybe_put_forwarded_env_vars(env) when is_map(env) do
+    Enum.reduce(@forwarded_env_vars, env, fn name, acc ->
+      maybe_put_port_env(acc, name, env_value(name))
+    end)
+  end
+
+  defp maybe_put_forwarded_env_prefixes(env) when is_map(env) do
+    System.get_env()
+    |> Enum.reduce(env, fn {name, value}, acc ->
+      if Enum.any?(@forwarded_env_prefixes, &String.starts_with?(name, &1)) do
+        maybe_put_port_env(acc, name, blank_env_value_to_nil(value))
+      else
+        acc
+      end
+    end)
+  end
+
+  defp xdg_config_home(source_home) when is_binary(source_home) and source_home != "" do
+    env_value("XDG_CONFIG_HOME") || Path.join(source_home, ".config")
+  end
+
+  defp git_config_global(source_home) when is_binary(source_home) and source_home != "" do
+    env_value("GIT_CONFIG_GLOBAL") || Path.join(source_home, ".gitconfig")
+  end
+
+  defp gh_config_dir(source_home) when is_binary(source_home) and source_home != "" do
+    env_value("GH_CONFIG_DIR") || Path.join(xdg_config_home(source_home), "gh")
+  end
+
+  defp gh_token(source_home) when is_binary(source_home) and source_home != "" do
+    env_value("GH_TOKEN") || env_value("GITHUB_TOKEN") || gh_auth_token(source_home)
+  end
+
+  defp gh_auth_token(source_home) when is_binary(source_home) and source_home != "" do
+    case System.find_executable("gh") do
+      executable when is_binary(executable) ->
+        case System.cmd(executable, ["auth", "token"],
+               env: gh_auth_env(source_home),
+               stderr_to_stdout: true
+             ) do
+          {output, 0} -> output |> String.trim() |> blank_env_value_to_nil()
+          {_output, _status} -> nil
+        end
+
+      _ ->
+        nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp gh_auth_env(source_home) when is_binary(source_home) and source_home != "" do
+    [{"HOME", source_home}]
+    |> maybe_put_cmd_env("GH_CONFIG_DIR", gh_config_dir(source_home))
+  end
+
+  defp maybe_put_port_env(env, _key, nil) when is_map(env), do: env
+
+  defp maybe_put_port_env(env, key, value) when is_map(env) and is_binary(key) and is_binary(value) do
+    case blank_env_value_to_nil(value) do
+      nil -> env
+      normalized -> Map.put(env, key, normalized)
+    end
+  end
+
+  defp maybe_put_default_port_env(env, key, value)
+       when is_map(env) and is_binary(key) and is_binary(value) do
+    if Map.has_key?(env, key) do
+      env
+    else
+      maybe_put_port_env(env, key, value)
+    end
+  end
+
+  defp maybe_put_default_port_env(env, _key, _value) when is_map(env), do: env
+
+  defp put_port_env(env, key, value) when is_map(env) and is_binary(key) and is_binary(value) do
+    Map.put(env, key, value)
+  end
+
+  defp maybe_put_cmd_env(env, _key, nil) when is_list(env), do: env
+
+  defp maybe_put_cmd_env(env, key, value) when is_list(env) and is_binary(key) and is_binary(value) do
+    [{key, value} | env]
+  end
+
+  defp env_value(name) when is_binary(name) do
+    name
+    |> System.get_env()
+    |> blank_env_value_to_nil()
+  end
+
+  defp blank_env_value_to_nil(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp blank_env_value_to_nil(_value), do: nil
 
   defp cleanup_codex_launch_home(path) when is_binary(path) and path != "" do
     File.rm_rf(path)

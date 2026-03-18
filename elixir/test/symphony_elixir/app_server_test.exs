@@ -1773,6 +1773,557 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server passes GH_CONFIG_DIR through to the launch environment" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-gh-config-dir-#{System.unique_integer([:positive])}"
+      )
+
+    previous_home = System.get_env("HOME")
+    previous_gh_config_dir = System.get_env("GH_CONFIG_DIR")
+
+    try do
+      source_home = Path.join(test_root, "source-home")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-906")
+      codex_binary = Path.join(test_root, "fake-codex")
+      gh_config_dir = Path.join(source_home, ".config/gh")
+
+      on_exit(fn ->
+        restore_env("HOME", previous_home)
+        restore_env("GH_CONFIG_DIR", previous_gh_config_dir)
+      end)
+
+      File.mkdir_p!(Path.join(source_home, ".codex"))
+      File.mkdir_p!(gh_config_dir)
+      File.mkdir_p!(workspace)
+
+      System.put_env("HOME", source_home)
+      System.delete_env("GH_CONFIG_DIR")
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            if [ "${GH_CONFIG_DIR:-}" != "#{gh_config_dir}" ]; then
+              printf 'unexpected GH_CONFIG_DIR=%s\\n' "${GH_CONFIG_DIR:-}" >&2
+              sleep 1
+            else
+              printf '%s\\n' '{"id":1,"result":{}}'
+            fi
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-906"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-906"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 2_000
+      )
+
+      issue = %Issue{
+        id: "issue-gh-config-dir",
+        identifier: "MT-906",
+        title: "Pass GH_CONFIG_DIR into launch env",
+        description: "Ensure gh can reuse the operator's auth config while HOME is isolated",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-906",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server preserves an explicit GH_CONFIG_DIR override" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-gh-config-override-#{System.unique_integer([:positive])}"
+      )
+
+    previous_home = System.get_env("HOME")
+    previous_gh_config_dir = System.get_env("GH_CONFIG_DIR")
+
+    try do
+      source_home = Path.join(test_root, "source-home")
+      explicit_gh_config_dir = Path.join(test_root, "shared-gh-config")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-907")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      on_exit(fn ->
+        restore_env("HOME", previous_home)
+        restore_env("GH_CONFIG_DIR", previous_gh_config_dir)
+      end)
+
+      File.mkdir_p!(Path.join(source_home, ".codex"))
+      File.mkdir_p!(explicit_gh_config_dir)
+      File.mkdir_p!(workspace)
+
+      System.put_env("HOME", source_home)
+      System.put_env("GH_CONFIG_DIR", explicit_gh_config_dir)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            if [ "${GH_CONFIG_DIR:-}" != "#{explicit_gh_config_dir}" ]; then
+              printf 'unexpected GH_CONFIG_DIR=%s\\n' "${GH_CONFIG_DIR:-}" >&2
+              sleep 1
+            else
+              printf '%s\\n' '{"id":1,"result":{}}'
+            fi
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-907"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-907"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 2_000
+      )
+
+      issue = %Issue{
+        id: "issue-gh-config-override",
+        identifier: "MT-907",
+        title: "Preserve explicit GH_CONFIG_DIR override",
+        description: "Ensure explicit gh config overrides survive the isolated launch home",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-907",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server passes an explicit GH_TOKEN through to the launch environment" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-gh-token-env-#{System.unique_integer([:positive])}"
+      )
+
+    previous_home = System.get_env("HOME")
+    previous_gh_token = System.get_env("GH_TOKEN")
+
+    try do
+      source_home = Path.join(test_root, "source-home")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-908")
+      codex_binary = Path.join(test_root, "fake-codex")
+      gh_token = "gho_explicit_test_token"
+
+      on_exit(fn ->
+        restore_env("HOME", previous_home)
+        restore_env("GH_TOKEN", previous_gh_token)
+      end)
+
+      File.mkdir_p!(Path.join(source_home, ".codex"))
+      File.mkdir_p!(workspace)
+
+      System.put_env("HOME", source_home)
+      System.put_env("GH_TOKEN", gh_token)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            if [ "${GH_TOKEN:-}" != "#{gh_token}" ]; then
+              printf 'unexpected GH_TOKEN=%s\\n' "${GH_TOKEN:-}" >&2
+              sleep 1
+            else
+              printf '%s\\n' '{"id":1,"result":{}}'
+            fi
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-908"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-908"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 2_000
+      )
+
+      issue = %Issue{
+        id: "issue-gh-token-env",
+        identifier: "MT-908",
+        title: "Pass explicit GH_TOKEN into launch env",
+        description: "Ensure explicit GitHub auth tokens survive the isolated launch home",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-908",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server falls back to gh auth token for GH_TOKEN" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-gh-token-fallback-#{System.unique_integer([:positive])}"
+      )
+
+    previous_home = System.get_env("HOME")
+    previous_gh_token = System.get_env("GH_TOKEN")
+    previous_path = System.get_env("PATH")
+
+    try do
+      source_home = Path.join(test_root, "source-home")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-909")
+      codex_binary = Path.join(test_root, "fake-codex")
+      fake_gh = Path.join(test_root, "gh")
+      gh_token = "gho_fallback_test_token"
+
+      on_exit(fn ->
+        restore_env("HOME", previous_home)
+        restore_env("GH_TOKEN", previous_gh_token)
+        restore_env("PATH", previous_path)
+      end)
+
+      File.mkdir_p!(Path.join(source_home, ".codex"))
+      File.mkdir_p!(workspace)
+
+      System.put_env("HOME", source_home)
+      System.delete_env("GH_TOKEN")
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+
+      File.write!(fake_gh, """
+      #!/bin/sh
+      if [ "$1" = "auth" ] && [ "$2" = "token" ]; then
+        printf '%s\\n' '#{gh_token}'
+        exit 0
+      fi
+
+      printf 'unexpected gh invocation: %s\\n' "$*" >&2
+      exit 1
+      """)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            if [ "${GH_TOKEN:-}" != "#{gh_token}" ]; then
+              printf 'unexpected GH_TOKEN=%s\\n' "${GH_TOKEN:-}" >&2
+              sleep 1
+            else
+              printf '%s\\n' '{"id":1,"result":{}}'
+            fi
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-909"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-909"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(fake_gh, 0o755)
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 2_000
+      )
+
+      issue = %Issue{
+        id: "issue-gh-token-fallback",
+        identifier: "MT-909",
+        title: "Resolve GH_TOKEN from gh auth token",
+        description: "Ensure app server can inject a GitHub token resolved from the parent environment",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-909",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server forwards git and jj identity env vars into the launch environment" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-vcs-env-#{System.unique_integer([:positive])}"
+      )
+
+    forwarded_env = %{
+      "GIT_AUTHOR_NAME" => "Symphony Author",
+      "GIT_AUTHOR_EMAIL" => "author@example.com",
+      "GIT_COMMITTER_NAME" => "Symphony Committer",
+      "GIT_COMMITTER_EMAIL" => "committer@example.com",
+      "JJ_USER" => "Symphony JJ User",
+      "JJ_EMAIL" => "jj@example.com",
+      "SSH_AUTH_SOCK" => "/tmp/symphony-test.sock"
+    }
+
+    previous_env =
+      Map.new(Map.keys(forwarded_env), fn key ->
+        {key, System.get_env(key)}
+      end)
+
+    try do
+      source_home = Path.join(test_root, "source-home")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-910")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      on_exit(fn ->
+        Enum.each(previous_env, fn {key, value} -> restore_env(key, value) end)
+      end)
+
+      File.mkdir_p!(Path.join(source_home, ".codex"))
+      File.mkdir_p!(workspace)
+
+      Enum.each(forwarded_env, fn {key, value} ->
+        System.put_env(key, value)
+      end)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            if [ "${GIT_AUTHOR_NAME:-}" != "#{forwarded_env["GIT_AUTHOR_NAME"]}" ] || \
+               [ "${GIT_AUTHOR_EMAIL:-}" != "#{forwarded_env["GIT_AUTHOR_EMAIL"]}" ] || \
+               [ "${GIT_COMMITTER_NAME:-}" != "#{forwarded_env["GIT_COMMITTER_NAME"]}" ] || \
+               [ "${GIT_COMMITTER_EMAIL:-}" != "#{forwarded_env["GIT_COMMITTER_EMAIL"]}" ] || \
+               [ "${JJ_USER:-}" != "#{forwarded_env["JJ_USER"]}" ] || \
+               [ "${JJ_EMAIL:-}" != "#{forwarded_env["JJ_EMAIL"]}" ] || \
+               [ "${SSH_AUTH_SOCK:-}" != "#{forwarded_env["SSH_AUTH_SOCK"]}" ]; then
+              env | grep -E '^(GIT_AUTHOR|GIT_COMMITTER|JJ_|SSH_AUTH_SOCK)=' >&2
+              sleep 1
+            else
+              printf '%s\\n' '{"id":1,"result":{}}'
+            fi
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-910"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-910"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 2_000
+      )
+
+      issue = %Issue{
+        id: "issue-vcs-env",
+        identifier: "MT-910",
+        title: "Forward vcs identity env",
+        description: "Ensure git and jj identity env survives the isolated launch home",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-910",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server derives shared config paths from the operator home" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-config-paths-#{System.unique_integer([:positive])}"
+      )
+
+    previous_home = System.get_env("HOME")
+    previous_xdg_config_home = System.get_env("XDG_CONFIG_HOME")
+    previous_git_config_global = System.get_env("GIT_CONFIG_GLOBAL")
+    previous_gh_config_dir = System.get_env("GH_CONFIG_DIR")
+
+    try do
+      source_home = Path.join(test_root, "source-home")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-911")
+      codex_binary = Path.join(test_root, "fake-codex")
+      expected_xdg_config_home = Path.join(source_home, ".config")
+      expected_git_config_global = Path.join(source_home, ".gitconfig")
+      expected_gh_config_dir = Path.join(expected_xdg_config_home, "gh")
+
+      on_exit(fn ->
+        restore_env("HOME", previous_home)
+        restore_env("XDG_CONFIG_HOME", previous_xdg_config_home)
+        restore_env("GIT_CONFIG_GLOBAL", previous_git_config_global)
+        restore_env("GH_CONFIG_DIR", previous_gh_config_dir)
+      end)
+
+      File.mkdir_p!(Path.join(source_home, ".codex"))
+      File.mkdir_p!(expected_gh_config_dir)
+      File.mkdir_p!(workspace)
+      File.write!(expected_git_config_global, "[user]\n\tname = Symphony Test\n")
+
+      System.put_env("HOME", source_home)
+      System.delete_env("XDG_CONFIG_HOME")
+      System.delete_env("GIT_CONFIG_GLOBAL")
+      System.delete_env("GH_CONFIG_DIR")
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            if [ "${XDG_CONFIG_HOME:-}" != "#{expected_xdg_config_home}" ] || \
+               [ "${GIT_CONFIG_GLOBAL:-}" != "#{expected_git_config_global}" ] || \
+               [ "${GH_CONFIG_DIR:-}" != "#{expected_gh_config_dir}" ]; then
+              env | grep -E '^(XDG_CONFIG_HOME|GIT_CONFIG_GLOBAL|GH_CONFIG_DIR)=' >&2
+              sleep 1
+            else
+              printf '%s\\n' '{"id":1,"result":{}}'
+            fi
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-911"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-911"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 2_000
+      )
+
+      issue = %Issue{
+        id: "issue-config-paths",
+        identifier: "MT-911",
+        title: "Derive shared config paths",
+        description: "Ensure app server points git, jj, and gh at the operator config while HOME is isolated",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-911",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Prompt text", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   defp start_test_image_server!(status, content_type, body)
        when is_integer(status) and is_binary(content_type) and is_binary(body) do
     {:ok, listen_socket} =

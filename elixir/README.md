@@ -80,6 +80,21 @@ Optional flags:
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
 - `--port` also starts the Phoenix observability service (default: disabled)
 
+For `mix release`, use environment variables instead:
+
+```bash
+SYMPHONY_WORKFLOW_FILE=/path/to/WORKFLOW.md \
+SYMPHONY_LOGS_ROOT=/path/to/log-root \
+SYMPHONY_PORT=4000 \
+_build/dev/rel/symphony_elixir/bin/symphony_elixir start
+```
+
+Release startup precedence is:
+
+- explicit in-process app env / CLI overrides
+- `SYMPHONY_WORKFLOW_FILE`, `SYMPHONY_LOGS_ROOT`, `SYMPHONY_PORT`
+- current-directory defaults such as `./WORKFLOW.md`
+
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
 
@@ -146,6 +161,10 @@ Notes:
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
   while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
   launched shell.
+- During app-server sessions, Symphony still isolates `HOME`, but it forwards operator Git/Jujutsu/
+  GitHub identity and config context that tooling commonly needs. In practice that includes
+  `GIT_AUTHOR_*`, `GIT_COMMITTER_*`, `JJ_*`, `SSH_AUTH_SOCK`, `GITHUB_TOKEN`, `XDG_CONFIG_HOME`,
+  `GIT_CONFIG_GLOBAL`, `GH_CONFIG_DIR`, and `GH_TOKEN` (with `gh auth token` fallback).
 
 ```yaml
 tracker:
