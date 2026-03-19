@@ -81,12 +81,39 @@ defmodule SymphonyElixir.StartupOverridesTest do
     assert Application.get_env(:symphony_elixir, :server_port_override) == nil
   end
 
+  test "apply/1 rejects negative SYMPHONY_PORT values without applying partial overrides" do
+    assert {:error, message} =
+             StartupOverrides.apply(%{
+               "SYMPHONY_WORKFLOW_FILE" => "tmp/release/WORKFLOW.md",
+               "SYMPHONY_LOGS_ROOT" => "tmp/release-logs",
+               "SYMPHONY_PORT" => "-1"
+             })
+
+    assert message =~ "Invalid SYMPHONY_PORT"
+    assert Application.get_env(:symphony_elixir, :workflow_file_path) == nil
+    assert Application.get_env(:symphony_elixir, :log_file) == nil
+    assert Application.get_env(:symphony_elixir, :server_port_override) == nil
+  end
+
   test "apply/1 ignores blank release env vars" do
     assert :ok =
              StartupOverrides.apply(%{
                "SYMPHONY_WORKFLOW_FILE" => "   ",
                "SYMPHONY_LOGS_ROOT" => "",
                "SYMPHONY_PORT" => "  "
+             })
+
+    assert Application.get_env(:symphony_elixir, :workflow_file_path) == nil
+    assert Application.get_env(:symphony_elixir, :log_file) == nil
+    assert Application.get_env(:symphony_elixir, :server_port_override) == nil
+  end
+
+  test "apply/1 ignores non-binary release env values" do
+    assert :ok =
+             StartupOverrides.apply(%{
+               "SYMPHONY_WORKFLOW_FILE" => nil,
+               "SYMPHONY_LOGS_ROOT" => 123,
+               "SYMPHONY_PORT" => false
              })
 
     assert Application.get_env(:symphony_elixir, :workflow_file_path) == nil

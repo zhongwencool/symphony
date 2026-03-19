@@ -31,6 +31,11 @@ defmodule SymphonyElixir.TestSupport do
             "symphony-elixir-workflow-#{System.unique_integer([:positive])}"
           )
 
+        Application.delete_env(:symphony_elixir, :workflow_file_path)
+        Application.delete_env(:symphony_elixir, :server_port_override)
+        Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+        Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+
         File.mkdir_p!(workflow_root)
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
         write_workflow_file!(workflow_file)
