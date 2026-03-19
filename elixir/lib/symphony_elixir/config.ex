@@ -121,6 +121,9 @@ defmodule SymphonyElixir.Config do
   @spec agent_max_turns() :: pos_integer()
   def agent_max_turns, do: settings!().agent.max_turns
 
+  @spec agent_max_continuations() :: pos_integer()
+  def agent_max_continuations, do: settings!().agent.max_continuations
+
   @spec max_retry_backoff_ms() :: pos_integer()
   def max_retry_backoff_ms, do: settings!().agent.max_retry_backoff_ms
 

@@ -39,6 +39,7 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_continuations: 3
 codex:
   command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
   read_timeout_ms: 30000

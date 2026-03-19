@@ -594,6 +594,7 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `hooks.timeout_ms`: integer, default `300000`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
+- `agent.max_continuations`: integer, default `3`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
@@ -645,7 +646,7 @@ Important nuance:
   original task prompt that is already present in thread history.
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
-  session.
+  session, up to `agent.max_continuations` worker sessions before it stops retrying.
 
 ### 7.2 Run Attempt Lifecycle
 
@@ -677,7 +678,7 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Remove running entry.
   - Update aggregate runtime totals.
   - Schedule continuation retry (attempt `1`) after the worker exhausts or finishes its in-process
-    turn loop.
+    turn loop, unless the issue has already reached `agent.max_continuations` worker sessions.
 
 - `Worker Exit (abnormal)`
   - Remove running entry.
@@ -2035,7 +2036,8 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Non-active state stops running agent without workspace cleanup
 - Terminal state stops running agent and cleans workspace
 - Reconciliation with no running issues is a no-op
-- Normal worker exit schedules a short continuation retry (attempt 1)
+- Normal worker exit schedules a short continuation retry (attempt 1) until
+  `agent.max_continuations` is reached
 - Abnormal worker exit increments retries with 10s-based exponential backoff
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error

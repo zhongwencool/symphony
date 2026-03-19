@@ -24,6 +24,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.image_inputs.allowed_hosts == ["uploads.linear.app"]
     assert config.tracker.image_inputs.allow_http == false
     assert config.agent.max_turns == 20
+    assert config.agent.max_continuations == 3
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -43,6 +44,13 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_continuations: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_continuations"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_continuations: 4)
+    assert Config.settings!().agent.max_continuations == 4
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert Config.settings!().tracker.active_states == ["Todo", "Review"]
@@ -576,6 +584,52 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, before_down_ms, 500, 1_100)
+    assert state.continuation_counts[issue_id] == 1
+  end
+
+  test "continuation limit stops retries after max_continuations" do
+    issue_id = "issue-continuation-limit"
+    orchestrator_name = Module.concat(__MODULE__, :ContinuationLimitOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    max_continuations = Config.agent_max_continuations()
+    initial_state = :sys.get_state(pid)
+
+    # Simulate state where continuation count already equals max_continuations
+    ref = make_ref()
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-LIMIT",
+      issue: %Issue{id: issue_id, identifier: "MT-LIMIT", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+      |> Map.put(:continuation_counts, %{issue_id => max_continuations})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    # Should NOT schedule a retry
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    # Continuation count should be cleared
+    refute Map.has_key?(state.continuation_counts, issue_id)
+    # Should still be marked as completed
+    assert MapSet.member?(state.completed, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do

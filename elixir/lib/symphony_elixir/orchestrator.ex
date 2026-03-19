@@ -38,6 +38,7 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
+      continuation_counts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -129,33 +130,7 @@ defmodule SymphonyElixir.Orchestrator do
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
-
-        state =
-          case reason do
-            :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
-
-            _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
-              next_attempt = next_retry_attempt_from_running(running_entry)
-
-              schedule_issue_retry(state, issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
-          end
+        state = handle_running_task_down(state, issue_id, running_entry, session_id, reason)
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -776,6 +751,82 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp handle_running_task_down(state, issue_id, running_entry, session_id, :normal) do
+    continuation_count = Map.get(state.continuation_counts, issue_id, 0) + 1
+    max_continuations = Config.agent_max_continuations()
+
+    if continuation_count > max_continuations do
+      Logger.warning(
+        "Exceeded max_continuations (#{max_continuations}) for issue_id=#{issue_id} " <>
+          "issue_identifier=#{running_entry.identifier}; stopping retries"
+      )
+
+      notify_continuation_limit_reached(issue_id, running_entry.identifier, max_continuations)
+
+      state
+      |> complete_issue(issue_id)
+      |> clear_continuation_count(issue_id)
+    else
+      Logger.info(
+        "Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; " <>
+          "scheduling active-state continuation check (#{continuation_count}/#{max_continuations})"
+      )
+
+      state
+      |> complete_issue(issue_id)
+      |> increment_continuation_count(issue_id, continuation_count)
+      |> schedule_issue_retry(issue_id, 1, %{
+        identifier: running_entry.identifier,
+        delay_type: :continuation,
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path)
+      })
+    end
+  end
+
+  defp handle_running_task_down(state, issue_id, running_entry, session_id, reason) do
+    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+
+    next_attempt = next_retry_attempt_from_running(running_entry)
+
+    schedule_issue_retry(state, issue_id, next_attempt, %{
+      identifier: running_entry.identifier,
+      error: "agent exited: #{inspect(reason)}",
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    })
+  end
+
+  defp increment_continuation_count(%State{} = state, issue_id, count) do
+    %{state | continuation_counts: Map.put(state.continuation_counts, issue_id, count)}
+  end
+
+  defp clear_continuation_count(%State{} = state, issue_id) do
+    %{state | continuation_counts: Map.delete(state.continuation_counts, issue_id)}
+  end
+
+  defp notify_continuation_limit_reached(issue_id, identifier, max_continuations) do
+    max_turns = Config.agent_max_turns()
+    total_turns = max_turns * max_continuations
+
+    body =
+      "⚠️ **Symphony: Continuation limit reached**\n\n" <>
+        "Issue `#{identifier}` exhausted #{max_continuations} continuation cycles " <>
+        "(#{total_turns} total turns at #{max_turns} turns/cycle) without reaching a terminal state.\n\n" <>
+        "The agent has been stopped to prevent further token usage. " <>
+        "Please review the current state and either:\n" <>
+        "- Move the issue to a terminal state (Done/Cancelled) if the work is complete\n" <>
+        "- Address any blockers and move the issue back to an active state to restart the agent"
+
+    case Tracker.create_comment(issue_id, body) do
+      :ok ->
+        Logger.info("Posted continuation limit comment for issue_id=#{issue_id} issue_identifier=#{identifier}")
+
+      {:error, reason} ->
+        Logger.warning("Failed to post continuation limit comment for issue_id=#{issue_id}: #{inspect(reason)}")
+    end
+  end
+
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
@@ -928,7 +979,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
-    %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+    %{state | claimed: MapSet.delete(state.claimed, issue_id), continuation_counts: Map.delete(state.continuation_counts, issue_id)}
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
