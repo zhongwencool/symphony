@@ -86,14 +86,35 @@ For `mix release`, use environment variables instead:
 SYMPHONY_WORKFLOW_FILE=/path/to/WORKFLOW.md \
 SYMPHONY_LOGS_ROOT=/path/to/log-root \
 SYMPHONY_PORT=4000 \
+SYMPHONY_GITHUB_TOKEN_FILE=/path/to/github-token \
 _build/dev/rel/symphony_elixir/bin/symphony_elixir start
 ```
 
 Release startup precedence is:
 
 - explicit in-process app env / CLI overrides
-- `SYMPHONY_WORKFLOW_FILE`, `SYMPHONY_LOGS_ROOT`, `SYMPHONY_PORT`
+- existing `GH_TOKEN` / `GITHUB_TOKEN` in the Symphony service environment
+- `SYMPHONY_WORKFLOW_FILE`, `SYMPHONY_LOGS_ROOT`, `SYMPHONY_PORT`, `SYMPHONY_GH_TOKEN`,
+  `SYMPHONY_GITHUB_TOKEN`, `SYMPHONY_GH_TOKEN_FILE`, `SYMPHONY_GITHUB_TOKEN_FILE`
 - current-directory defaults such as `./WORKFLOW.md`
+
+For long-running macOS services, prefer injecting GitHub auth into the Symphony service itself
+instead of relying on `gh auth` + Keychain inside background app-server turns. The recommended
+setup is a token file referenced from launchd:
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+  <key>SYMPHONY_WORKFLOW_FILE</key>
+  <string>/Users/you/code/project/WORKFLOW.md</string>
+  <key>SYMPHONY_GITHUB_TOKEN_FILE</key>
+  <string>/Users/you/.config/symphony/github-token</string>
+</dict>
+```
+
+At startup Symphony reads the file, trims trailing whitespace, and exports the same token to both
+`GH_TOKEN` and `GITHUB_TOKEN` for the running BEAM node. That token is then forwarded into isolated
+Codex app-server sessions without depending on `gh auth token`.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.
@@ -167,7 +188,8 @@ Notes:
 - During app-server sessions, Symphony still isolates `HOME`, but it forwards operator Git/Jujutsu/
   GitHub identity and config context that tooling commonly needs. In practice that includes
   `GIT_AUTHOR_*`, `GIT_COMMITTER_*`, `JJ_*`, `SSH_AUTH_SOCK`, `GITHUB_TOKEN`, `XDG_CONFIG_HOME`,
-  `GIT_CONFIG_GLOBAL`, `GH_CONFIG_DIR`, and `GH_TOKEN` (with `gh auth token` fallback).
+  `GIT_CONFIG_GLOBAL`, `GH_CONFIG_DIR`, and `GH_TOKEN` (with `gh auth token` fallback as a last
+  resort when no service token was injected).
 
 ```yaml
 tracker:
